@@ -1,20 +1,7 @@
 #include "fat32.h"
 
 /*
- * Kleiner, bewusst konservativer FAT32-Treiber für VeloOS.
- *
- * Unterstützt:
- * - FAT32 mit 512-Byte-Sektoren
- * - 8.3-Dateinamen
- * - Lesen kompletter Dateien bis max_size
- * - Schreiben/Ersetzen von Dateien
- * - mehrere FAT-Kopien
- * - Wachstum des Root-Verzeichnisses, falls nötig
- *
- * Nicht unterstützt:
- * - Long File Names
- * - Unterverzeichnisse als Pfad
- * - exFAT/FAT16/FAT12
+ * Sicherer FAT32-Treiber mit integrierter Formatier-Funktion
  */
 
 static FAT32_BPB bpb;
@@ -24,9 +11,9 @@ static UINT32 total_clusters = 0;
 static void *g_port = 0;
 static int g_initialized = 0;
 
-#define FAT_EOC          0x0FFFFFF8U
-#define FAT_BAD          0x0FFFFFF7U
-#define FAT_FREE         0x00000000U
+#define FAT_EOC           0x0FFFFFF8U
+#define FAT_BAD           0x0FFFFFF7U
+#define FAT_FREE          0x00000000U
 #define FAT32_MAX_CLUSTER 0x0FFFFFF6U
 
 static UINT32 get_total_sectors(void) {
@@ -91,7 +78,6 @@ int fat32_init(void *ahci_port) {
 
     __builtin_memcpy(&bpb, sector_buf, sizeof(FAT32_BPB));
 
-    /* Grundlegende BPB-Validierung. */
     if (bpb.bytes_per_sector != 512) return 0;
     if (bpb.sectors_per_cluster == 0) return 0;
     if ((bpb.sectors_per_cluster & (bpb.sectors_per_cluster - 1)) != 0) return 0;
@@ -111,9 +97,6 @@ int fat32_init(void *ahci_port) {
     UINT32 data_sectors = total_sectors - (UINT32)data_start;
     total_clusters = data_sectors / bpb.sectors_per_cluster;
 
-    /* FAT32 ist hier über table_size_32 + Root-Cluster identifiziert.
-       Kleine Test-Images (z.B. unsere 64-MiB-QEMU-Disk) können bewusst
-       weniger als die kanonischen 65525 Datencluster besitzen. */
     if (total_clusters == 0) return 0;
     if (total_clusters > FAT32_MAX_CLUSTER - 1U) return 0;
 
@@ -126,6 +109,88 @@ int fat32_init(void *ahci_port) {
     return 1;
 }
 
+int fat32_format(void *ahci_port, UINT64 disk_sectors) {
+    if (!ahci_port) return 0;
+    
+    if (disk_sectors == 0) disk_sectors = 131072; /* Fallback: 64MB */
+
+    UINT32 total_sec = (disk_sectors > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (UINT32)disk_sectors;
+    UINT8 spc = 8; /* 4KB Cluster */
+    UINT16 reserved = 32;
+    UINT8 num_fats = 2;
+
+    UINT32 fat_size = ((total_sec / spc) * 4U + 511U) / 512U;
+
+    UINT8 sector[512];
+    __builtin_memset(sector, 0, 512);
+
+    /* 1. BPB erstellen */
+    sector[0] = 0xEB; sector[1] = 0x58; sector[2] = 0x90;
+    __builtin_memcpy(&sector[3], "MSDOS5.0", 8);
+    sector[11] = 0x00; sector[12] = 0x02; /* 512 Bytes / Sector */
+    sector[13] = spc;
+    sector[14] = (UINT8)(reserved & 0xFF);
+    sector[15] = (UINT8)((reserved >> 8) & 0xFF);
+    sector[16] = num_fats;
+    sector[17] = 0; sector[18] = 0;
+    sector[19] = 0; sector[20] = 0;
+    sector[21] = 0xF8; /* Fixed Disk */
+    sector[22] = 0; sector[23] = 0;
+    sector[24] = 0x3F; sector[25] = 0x00;
+    sector[26] = 0xFF; sector[27] = 0x00;
+    write_u32_le(&sector[28], 0); /* Hidden */
+    write_u32_le(&sector[32], total_sec);
+    write_u32_le(&sector[36], fat_size);
+    sector[40] = 0; sector[41] = 0;
+    sector[42] = 0; sector[43] = 0;
+    write_u32_le(&sector[44], 2); /* Root Cluster 2 */
+    sector[48] = 1; sector[49] = 0; /* FSInfo sector 1 */
+    sector[50] = 6; sector[51] = 0; /* Backup boot sector 6 */
+    sector[64] = 0x80;
+    sector[66] = 0x29;
+    write_u32_le(&sector[67], 0x12345678);
+    __builtin_memcpy(&sector[71], "VELOOS DISK", 11);
+    __builtin_memcpy(&sector[82], "FAT32   ", 8);
+    sector[510] = 0x55; sector[511] = 0xAA;
+
+    if (!write_sata_sector(ahci_port, 0, 0, 1, sector)) return 0;
+    if (!write_sata_sector(ahci_port, 6, 0, 1, sector)) return 0; /* Backup Boot Sector */
+
+    /* 2. FSInfo Sektor */
+    __builtin_memset(sector, 0, 512);
+    write_u32_le(&sector[0], 0x41615252);
+    write_u32_le(&sector[484], 0x61417272);
+    write_u32_le(&sector[488], 0xFFFFFFFF);
+    write_u32_le(&sector[492], 2);
+    sector[510] = 0x55; sector[511] = 0xAA;
+    if (!write_sata_sector(ahci_port, 1, 0, 1, sector)) return 0;
+
+    /* 3. FAT1 und FAT2 initialisieren */
+    __builtin_memset(sector, 0, 512);
+    write_u32_le(&sector[0], 0x0FFFFFF8); /* Media descriptor */
+    write_u32_le(&sector[4], 0x0FFFFFFF); /* EOC */
+    write_u32_le(&sector[8], 0x0FFFFFFF); /* Root dir cluster EOC */
+
+    /* Erster Sektor der FAT1 & FAT2 */
+    if (!write_sata_sector(ahci_port, reserved, 0, 1, sector)) return 0;
+    if (!write_sata_sector(ahci_port, reserved + fat_size, 0, 1, sector)) return 0;
+
+    /* Restliche FAT Sektoren nullen */
+    __builtin_memset(sector, 0, 512);
+    for (UINT32 s = 1; s < fat_size; s++) {
+        if (!write_sata_sector(ahci_port, reserved + s, 0, 1, sector)) return 0;
+        if (!write_sata_sector(ahci_port, reserved + fat_size + s, 0, 1, sector)) return 0;
+    }
+
+    /* 4. Root-Verzeichnis (Cluster 2) leeren */
+    UINT32 root_lba = reserved + (num_fats * fat_size);
+    for (UINT32 s = 0; s < spc; s++) {
+        if (!write_sata_sector(ahci_port, root_lba + s, 0, 1, sector)) return 0;
+    }
+
+    return fat32_init(ahci_port);
+}
+
 static UINT32 get_next_cluster(UINT32 cluster) {
     UINT8 fat_buf[512];
 
@@ -134,7 +199,6 @@ static UINT32 get_next_cluster(UINT32 cluster) {
     UINT32 fat_sector = fat_sector_for_cluster(cluster);
     UINT32 ent_offset = fat_offset_in_sector(cluster);
 
-    /* Ein FAT32-Eintrag darf bei 512 Byte nicht über die Sektorgrenze laufen. */
     if (ent_offset > 508U) return FAT_BAD;
 
     if (!read_sata_sector(g_port, fat_sector, 0, 1, fat_buf)) {
@@ -263,9 +327,9 @@ static int names_equal(const UINT8 *a, const char *b) {
 static int is_regular_short_entry(const FAT32_DIR_ENTRY *entry) {
     if (entry->name[0] == 0x00) return 0;
     if (entry->name[0] == 0xE5) return 0;
-    if (entry->attr == 0x0F) return 0; /* LFN */
-    if (entry->attr & 0x08) return 0;  /* Volume label */
-    if (entry->attr & 0x10) return 0;  /* Directory */
+    if (entry->attr == 0x0F) return 0;
+    if (entry->attr & 0x08) return 0;
+    if (entry->attr & 0x10) return 0;
     return 1;
 }
 
@@ -346,14 +410,12 @@ static int find_free_directory_entry(UINT32 *out_lba,
         UINT32 next = get_next_cluster(current_cluster);
 
         if (is_eoc(next)) {
-            /* Root-Verzeichnis braucht einen weiteren Cluster. */
             UINT32 new_cluster = find_free_cluster();
             if (new_cluster == 0) return 0;
 
             if (!set_next_cluster(previous_cluster, new_cluster)) return 0;
             if (!set_next_cluster(new_cluster, FAT_EOC)) return 0;
 
-            /* Neuen Directory-Cluster komplett leeren. */
             UINT8 zero_sector[512];
             __builtin_memset(zero_sector, 0, sizeof(zero_sector));
             UINT32 new_lba = cluster_to_lba(new_cluster);
@@ -460,7 +522,10 @@ int fat32_read_file(void *ahci_port,
                     const char *filename,
                     void *buffer,
                     UINT32 max_size) {
-    if (!g_initialized || !ahci_port || !filename || !buffer) return -1;
+    if (!ahci_port || !filename || !buffer) return -1;
+    if (g_port != ahci_port || !g_initialized) {
+        if (!fat32_init(ahci_port)) return -1;
+    }
 
     UINT32 entry_lba = 0;
     UINT32 entry_index = 0;
@@ -513,8 +578,6 @@ int fat32_read_file(void *ahci_port,
         file_cluster = next;
     }
 
-    /* Die API hat bisher die echte Dateigröße zurückgegeben. Das behalten wir
-       bei, auch wenn max_size kleiner als die Datei ist. */
     return (int)file_size;
 }
 
@@ -522,8 +585,11 @@ int fat32_write_file(void *ahci_port,
                      const char *filename,
                      void *buffer,
                      UINT32 size) {
-    if (!g_initialized || !ahci_port || !filename) return 0;
+    if (!ahci_port || !filename) return 0;
     if (size > 0 && !buffer) return 0;
+    if (g_port != ahci_port || !g_initialized) {
+        if (!fat32_init(ahci_port)) return 0;
+    }
 
     UINT32 target_lba = 0;
     UINT32 target_entry_idx = 0;
@@ -544,9 +610,6 @@ int fat32_write_file(void *ahci_port,
         __builtin_memset(&old_entry, 0, sizeof(old_entry));
     }
 
-    /* Zuerst die neue Datenkette vollständig reservieren. So bleibt eine
-       bestehende Datei erhalten, falls die Platte mitten in der Allocation
-       voll wird. */
     UINT32 clusters_needed = 0;
     if (size > 0) {
         clusters_needed = (size + bytes_per_cluster - 1U) / bytes_per_cluster;
@@ -595,8 +658,6 @@ int fat32_write_file(void *ahci_port,
         return 0;
     }
 
-    /* Erst nachdem der Directory-Eintrag auf die neue Kette zeigt, wird
-       die alte Kette freigegeben. */
     if (file_exists) {
         UINT32 old_first = ((UINT32)old_entry.first_cluster_high << 16) |
                            old_entry.first_cluster_low;

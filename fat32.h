@@ -53,12 +53,11 @@ typedef struct {
     UINT32 file_size;
 } __attribute__((packed)) FAT32_DIR_ENTRY;
 
-// Externe AHCI Funktionen einbinden
 int read_sata_sector(void *port, UINT32 start_lba_low, UINT32 start_lba_high, UINT32 sector_count, void *buf);
 int write_sata_sector(void *port, UINT32 start_lba_low, UINT32 start_lba_high, UINT32 sector_count, void *buf);
 
-// Funktionen des FAT32 Treibers
 int fat32_init(void *ahci_port);
+int fat32_format(void *ahci_port, UINT64 total_sectors);
 int fat32_read_file(void *ahci_port, const char *filename, void *buffer, UINT32 max_size);
 int fat32_write_file(void *ahci_port, const char *filename, void *buffer, UINT32 size);
 

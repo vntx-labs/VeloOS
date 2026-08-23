@@ -1,54 +1,66 @@
-// kernel.c - UEFI 64-Disk-Persistent OS Kernel (Strict No-RAM Account Storage)
+// kernel.c - UEFI OS Kernel mit Double Buffering & Pitch-Scanline Blitting
 #include <efi.h>
 #include <efilib.h>
 #include "keyboard.h"
 #include "font.h"
 #include "ahci.h"
 #include "fat32.h"
+#include "desktop.h"
+#include "wm.h"
 
-// Shell-Zustandstracker & Globale UEFI-Referenzen
+#define MAX_DRIVES 8
+
 char command_buffer[64];
 int command_length = 0;
 EFI_SYSTEM_TABLE* g_st;
 EFI_HANDLE g_image_handle;
 
-// AHCI / Festplatten-Zustand
-UINTN g_ahci_abar = 0;
-static void* active_ahci_port = NULL;
+typedef struct {
+    void *port;
+    int port_number;
+    UINT64 size_mb;
+    UINT64 sector_count;
+    int has_fat32;
+    char label[32];
+} DriveInfo;
 
-// GOP Grafik-Variablen & Cursor
+static DriveInfo drives[MAX_DRIVES];
+static int num_drives = 0;
+static int selected_drive = -1;
+static int drive_select_mode = 0;
+
 EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = NULL;
 UINTN gop_width = 0;
 UINTN gop_height = 0;
 VOID* framebuffer_base = NULL;
 UINTN framebuffer_size = 0;
 
+/* 32-Bit Linearer Backbuffer (bis 1920x1080) */
+static UINT32 g_backbuffer[1920 * 1080];
+
 UINTN gfx_cursor_x = 50;
 UINTN gfx_cursor_y = 190;
 
-int is_bare_metal = 0;     // Flag für UEFI Exit
+int is_bare_metal = 0;
+int system_mode = 0;
+int logged_in = 0;
 
-// System-Modi: 0 = Shell, 1 = Login-Screen, 2 = Account Setup Wizard, 3 = Desktop
-int system_mode = 0; 
+int format_mode = 0;
+char format_confirm[10];
+int format_confirm_len = 0;
 
-// Login State (Modus 1)
 char login_username[32];
 char login_password[32];
-int login_field_focus = 0; // 0: User, 1: Pass, 2: Login-Button
+int login_field_focus = 0;
 int login_len_u = 0;
 int login_len_p = 0;
 int login_error = 0;
 
-// Account Creator State (Modus 2)
 char ui_username[32];
 char ui_password[32];
-int ui_field_focus = 0; // 0: Username, 1: Password, 2: Speichern Button
+int ui_field_focus = 0;
 int ui_input_len_u = 0;
 int ui_input_len_p = 0;
-
-// Desktop State (Modus 3)
-int desktop_menu_open = 0;  
-int desktop_menu_focus = 0; 
 
 typedef struct {
     UINTN MapSize;
@@ -60,16 +72,18 @@ typedef struct {
 
 MemoryMap mmap;
 
-// Vorwärtsdeklarationen
 void put_pixel(UINTN x, UINTN y, UINT32 color);
+UINT32 get_pixel(UINTN x, UINTN y);
 void clear_screen_graphics(UINT32 color);
 void draw_string(const char* str, UINTN x, UINTN y, UINT32 fg_color, UINT32 bg_color);
 void draw_filled_rect(UINTN start_x, UINTN start_y, UINTN width, UINTN height, UINT32 color);
 void draw_window(UINTN x, UINTN y, UINTN w, UINTN h, const char* title);
+void swap_buffers(void);
+
 void show_login_screen();
-void show_desktop();
 void show_account_creator_ui();
-int check_account_exists();
+void show_drive_select_dialog();
+void show_format_dialog();
 
 int strcmp(const char* s1, const char* s2) {
     while (*s1 && (*s1 == *s2)) {
@@ -79,7 +93,6 @@ int strcmp(const char* s1, const char* s2) {
     return *(unsigned char*)s1 - *(unsigned char*)s2;
 }
 
-// XOR-Verschlüsselung für Account-Sicherheit
 void encrypt_data(char *data, UINT32 size) {
     char key = 0x5A;
     for (UINT32 i = 0; i < size; i++) {
@@ -87,52 +100,77 @@ void encrypt_data(char *data, UINT32 size) {
     }
 }
 
-// Prüft ausschließlich auf der Festplatte, ob ein Account existiert
 int check_account_exists() {
-    if (!active_ahci_port) return 0;
+    if (selected_drive < 0 || selected_drive >= num_drives) return 0;
+    void *port = drives[selected_drive].port;
+    if (!port) return 0;
     char record[64];
-    __builtin_memset(record, 0, 64);
-    if (fat32_read_file(active_ahci_port, "ACCOUNT.DAT", record, 64)) {
-        return 1;
-    }
-    return 0;
+    __builtin_memset(record, 0, sizeof(record));
+    int result = fat32_read_file(port, "ACCOUNT.DAT", record, sizeof(record));
+    __builtin_memset(record, 0, sizeof(record));
+    return result == 64;
 }
 
-// Account speichern (Schreibt direkt auf Disk, KEIN dauerhaftes Speichern im RAM)
 int save_account_to_disk(const char *user, const char *pass) {
-    if (!active_ahci_port) return 0;
+    if (selected_drive < 0 || selected_drive >= num_drives) return 0;
+    void *port = drives[selected_drive].port;
+    if (!port || !user || !pass) return 0;
 
     char record[64];
-    __builtin_memset(record, 0, 64);
-    
+    char verify[64];
+    __builtin_memset(record, 0, sizeof(record));
+    __builtin_memset(verify, 0, sizeof(verify));
+
     int i = 0;
-    while (user[i] && i < 31) { record[i] = user[i]; i++; }
+    while (user[i] && i < 31) {
+        record[i] = user[i];
+        i++;
+    }
+
     i = 32;
     int j = 0;
-    while (pass[j] && j < 31) { record[i++] = pass[j++]; }
+    while (pass[j] && j < 31) {
+        record[i++] = pass[j++];
+    }
 
-    encrypt_data(record, 64);
-    
-    // Direkt auf Disk schreiben
-    int result = fat32_write_file(active_ahci_port, "ACCOUNT.DAT", record, 64);
-    
-    // Sensible lokalen Daten im Stack/Puffer sofort löschen (Sicherheit)
-    __builtin_memset(record, 0, 64);
-    return result;
+    encrypt_data(record, sizeof(record));
+
+    if (!fat32_write_file(port, "ACCOUNT.DAT", record, sizeof(record))) {
+        __builtin_memset(record, 0, sizeof(record));
+        __builtin_memset(verify, 0, sizeof(verify));
+        return 0;
+    }
+
+    int verify_result = fat32_read_file(port, "ACCOUNT.DAT", verify, sizeof(verify));
+    int identical = (verify_result == 64);
+
+    if (identical) {
+        for (int k = 0; k < 64; k++) {
+            if ((unsigned char)record[k] != (unsigned char)verify[k]) {
+                identical = 0;
+                break;
+            }
+        }
+    }
+
+    __builtin_memset(record, 0, sizeof(record));
+    __builtin_memset(verify, 0, sizeof(verify));
+    return identical;
 }
 
-// Login verifizieren direkt von der Disk
 int verify_login(const char *user, const char *pass) {
-    if (!active_ahci_port) return 0;
+    if (selected_drive < 0 || selected_drive >= num_drives) return 0;
+    void *port = drives[selected_drive].port;
+    if (!port) return 0;
 
     char record[64];
     __builtin_memset(record, 0, 64);
 
-    if (!fat32_read_file(active_ahci_port, "ACCOUNT.DAT", record, 64)) {
-        return 0; // Kein Account auf Disk gefunden
+    if (fat32_read_file(port, "ACCOUNT.DAT", record, 64) != 64) {
+        return 0;
     }
 
-    encrypt_data(record, 64); // Entschlüsseln
+    encrypt_data(record, 64);
 
     char disk_user[32];
     char disk_pass[32];
@@ -144,14 +182,12 @@ int verify_login(const char *user, const char *pass) {
 
     int match = (strcmp(disk_user, user) == 0 && strcmp(disk_pass, pass) == 0);
 
-    // Sensible Daten aus dem Stack löschen
     __builtin_memset(record, 0, 64);
     __builtin_memset(disk_pass, 0, 32);
 
     return match;
 }
 
-// Direkte Port I/O für x86 PCI & Shutdown
 static inline void outl(unsigned short port, unsigned int val) {
     __asm__ volatile("outl %0, %1" : : "a"(val), "Nd"(port));
 }
@@ -181,23 +217,13 @@ void system_reboot() {
     while(1) { __asm__ volatile("cli; hlt"); }
 }
 
-UINT32 pci_config_read(UINT8 bus, UINT8 slot, UINT8 func, UINT8 offset) {
-    UINT32 address = (1U << 31) | ((UINT32)bus << 16) | ((UINT32)(slot & 0x1F) << 11) | ((UINT32)(func & 0x07) << 8) | (UINT32)(offset & 0xFC);
-    outl(0xCF8, address);
-    return inl(0xCFC);
-}
-
-void discover_ahci_bar_direct() {
-    for (UINT8 slot = 0; slot < 32; slot++) {
-        UINT32 vendor_device = pci_config_read(0, slot, 0, 0x00);
-        if ((vendor_device & 0xFFFF) == 0xFFFF) continue;
-        UINT32 class_code = pci_config_read(0, slot, 0, 0x08);
-        if (((class_code >> 24) & 0xFF) == 0x01 && ((class_code >> 16) & 0xFF) == 0x06) {
-            UINT32 bar5 = pci_config_read(0, slot, 0, 0x24);
-            g_ahci_abar = (UINTN)(bar5 & 0xFFFFFFF0);
-            break;
-        }
+int format_disk_fat32(void *port) {
+    if (!port || selected_drive < 0 || selected_drive >= num_drives) return 0;
+    UINT64 sec_count = drives[selected_drive].sector_count;
+    if (sec_count == 0) {
+        sec_count = drives[selected_drive].size_mb * 2048ULL;
     }
+    return fat32_format(port, sec_count);
 }
 
 void init_gop() {
@@ -211,15 +237,32 @@ void init_gop() {
 }
 
 void put_pixel(UINTN x, UINTN y, UINT32 color) {
-    if (framebuffer_base == NULL || x >= gop_width || y >= gop_height) return;
-    UINT32* pixel_addr = (UINT32*)((UINT8*)framebuffer_base + (y * gop->Mode->Info->PixelsPerScanLine + x) * sizeof(UINT32));
-    *pixel_addr = color;
+    if (x >= gop_width || y >= gop_height) return;
+    g_backbuffer[y * gop_width + x] = color;
+}
+
+UINT32 get_pixel(UINTN x, UINTN y) {
+    if (x >= gop_width || y >= gop_height) return 0;
+    return g_backbuffer[y * gop_width + x];
 }
 
 void clear_screen_graphics(UINT32 color) {
-    if (framebuffer_base == NULL) return;
+    UINTN total = gop_width * gop_height;
+    if (total > 1920 * 1080) total = 1920 * 1080;
+    for (UINTN i = 0; i < total; i++) {
+        g_backbuffer[i] = color;
+    }
+}
+
+/* 1. Exakter Pitch/Scanline-Blit ohne Bildversatz */
+void swap_buffers(void) {
+    if (!framebuffer_base || !gop) return;
+    UINT32* fb = (UINT32*)framebuffer_base;
+    UINTN scanline = gop->Mode->Info->PixelsPerScanLine;
+    if (scanline == 0) scanline = gop_width;
+
     for (UINTN y = 0; y < gop_height; y++) {
-        for (UINTN x = 0; x < gop_width; x++) put_pixel(x, y, color);
+        __builtin_memcpy(&fb[y * scanline], &g_backbuffer[y * gop_width], gop_width * sizeof(UINT32));
     }
 }
 
@@ -258,17 +301,219 @@ void draw_filled_rect(UINTN start_x, UINTN start_y, UINTN width, UINTN height, U
 }
 
 void draw_window(UINTN x, UINTN y, UINTN w, UINTN h, const char* title) {
-    draw_filled_rect(x + 6, y + 6, w, h, 0x0008080C); 
-    draw_filled_rect(x, y, w, h, 0x001E1E2E);         
-    draw_filled_rect(x, y, w, 34, 0x00007ACC);        
-    draw_string(title, x + 12, y + 9, 0x00FFFFFF, 0x00007ACC);
-    draw_filled_rect(x + w - 30, y + 4, 26, 26, 0x00D32F2F);
-    draw_string("X", x + w - 21, y + 9, 0x00FFFFFF, 0x00D32F2F);
+    draw_rounded_rect_aa((int)x + 6, (int)y + 6, (int)w, (int)h, 10, 0x00060810);
+    draw_rounded_rect_aa((int)x, (int)y, (int)w, (int)h, 8, 0x00181A24);
+    draw_rounded_rect_gradient((int)x, (int)y, (int)w, 34, 8, 0x001B62D6, 0x000E429C);
+    draw_filled_rect(x, y + 24, w, 10, 0x000E429C);
+    draw_string(title, x + 12, y + 8, 0x00FFFFFF, 0x000E429C);
+    draw_rounded_rect_aa((int)(x + w - 30), (int)y + 4, 24, 24, 6, 0x00E06C75);
+    draw_string("X", x + w - 22, y + 8, 0x00FFFFFF, 0x00E06C75);
 }
 
-// --- LOGIN-SCREEN (Modus 1) ---
+void show_drive_select_dialog() {
+    clear_screen_graphics(0x000A0C14);
+    
+    UINTN win_w = 700;
+    UINTN win_h = 400;
+    UINTN win_x = (gop_width - win_w) / 2;
+    UINTN win_y = (gop_height - win_h) / 2;
+    
+    draw_window(win_x, win_y, win_w, win_h, "LAUFWERKS-AUSWAHL");
+    draw_string("Mehrere Laufwerke erkannt. Bitte Speichermedium waehlen:", win_x + 20, win_y + 50, 0x00FFFFFF, 0x00181A24);
+    
+    int y = win_y + 100;
+    for (int i = 0; i < num_drives && i < MAX_DRIVES; i++) {
+        UINT32 bg_color = (i == selected_drive) ? 0x001B62D6 : 0x0024283B;
+        draw_rounded_rect_aa((int)(win_x + 20), y, (int)(win_w - 40), 40, 6, bg_color);
+        
+        char info[64];
+        int pos = 0;
+        info[pos++] = 'P'; info[pos++] = 'o'; info[pos++] = 'r'; info[pos++] = 't'; info[pos++] = ' ';
+        info[pos++] = '0' + (char)drives[i].port_number;
+        info[pos++] = ':'; info[pos++] = ' ';
+        
+        if (drives[i].size_mb >= 1000) {
+            info[pos++] = '0' + (char)(drives[i].size_mb / 1000);
+            info[pos++] = 'G'; info[pos++] = 'B';
+        } else {
+            if (drives[i].size_mb >= 100) info[pos++] = '0' + (char)(drives[i].size_mb / 100);
+            if (drives[i].size_mb >= 10) info[pos++] = '0' + (char)((drives[i].size_mb / 10) % 10);
+            info[pos++] = '0' + (char)(drives[i].size_mb % 10);
+            info[pos++] = 'M'; info[pos++] = 'B';
+        }
+        info[pos++] = ' '; info[pos++] = '-'; info[pos++] = ' ';
+        
+        if (drives[i].has_fat32) {
+            info[pos++] = 'F'; info[pos++] = 'A'; info[pos++] = 'T'; info[pos++] = '3'; info[pos++] = '2';
+            info[pos++] = ' '; info[pos++] = 'O'; info[pos++] = 'K';
+        } else {
+            info[pos++] = 'N'; info[pos++] = 'I'; info[pos++] = 'C'; info[pos++] = 'H'; info[pos++] = 'T';
+            info[pos++] = ' '; info[pos++] = 'F'; info[pos++] = 'O'; info[pos++] = 'R'; info[pos++] = 'M';
+            info[pos++] = 'A'; info[pos++] = 'T'; info[pos++] = 'I'; info[pos++] = 'E'; info[pos++] = 'R'; info[pos++] = 'T';
+        }
+        info[pos] = '\0';
+        
+        draw_string(info, win_x + 30, y + 12, (i == selected_drive) ? 0x0000FFCC : 0x00FFFFFF, bg_color);
+        y += 50;
+    }
+    
+    draw_string("[W / S] Auswaehlen | [ENTER] Bestaetigen", win_x + 20, win_y + 350, 0x00777788, 0x00181A24);
+    swap_buffers();
+}
+
+void show_format_dialog() {
+    clear_screen_graphics(0x000A0C14);
+    
+    UINTN win_w = 600;
+    UINTN win_h = 400;
+    UINTN win_x = (gop_width - win_w) / 2;
+    UINTN win_y = (gop_height - win_h) / 2;
+    
+    draw_window(win_x, win_y, win_w, win_h, "FORMATIERUNG ERFORDERLICH");
+    draw_string("Das gewaehlte Laufwerk ist nicht mit FAT32 formatiert.", win_x + 20, win_y + 50, 0x00FFFFFF, 0x00181A24);
+    
+    if (selected_drive >= 0 && selected_drive < num_drives) {
+        draw_string("Laufwerk: Port ", win_x + 20, win_y + 90, 0x00FFFF00, 0x00181A24);
+        char port_num[2] = {'0' + (char)drives[selected_drive].port_number, '\0'};
+        draw_string(port_num, win_x + 180, win_y + 90, 0x00FFFF00, 0x00181A24);
+        
+        draw_string("Schaetzung Groesse:", win_x + 20, win_y + 120, 0x00FFFF00, 0x00181A24);
+        char size_str[16];
+        int pos = 0;
+        UINT64 mb = drives[selected_drive].size_mb;
+        if (mb >= 1000) {
+            size_str[pos++] = '0' + (char)(mb / 1000);
+            size_str[pos++] = 'G'; size_str[pos++] = 'B';
+        } else {
+            if (mb >= 100) size_str[pos++] = '0' + (char)(mb / 100);
+            if (mb >= 10) size_str[pos++] = '0' + (char)((mb / 10) % 10);
+            size_str[pos++] = '0' + (char)(mb % 10);
+            size_str[pos++] = 'M'; size_str[pos++] = 'B';
+        }
+        size_str[pos] = '\0';
+        draw_string(size_str, win_x + 350, win_y + 120, 0x0000FFCC, 0x00181A24);
+    }
+    
+    draw_string("!!! WARNUNG !!!", win_x + 20, win_y + 170, 0x00FF0000, 0x00181A24);
+    draw_string("Diese Operation wird ALLE DATEN auf dem Laufwerk", win_x + 20, win_y + 200, 0x00FF0000, 0x00181A24);
+    draw_string("unwiederruflich LOESCHEN!", win_x + 20, win_y + 230, 0x00FF0000, 0x00181A24);
+    
+    draw_string("Geben Sie 'YES' ein, um fortzufahren:", win_x + 20, win_y + 280, 0x00FFFFFF, 0x00181A24);
+    draw_rounded_rect_aa((int)(win_x + 20), (int)(win_y + 310), 200, 30, 6, 0x0024283B);
+    draw_string(format_confirm, win_x + 30, win_y + 316, 0x0000FF00, 0x0024283B);
+    
+    draw_string("[ESC] Abbrechen", win_x + 20, win_y + 360, 0x00777788, 0x00181A24);
+    swap_buffers();
+}
+
+void handle_drive_select_key(char c) {
+    if (c == 0x1B) {
+        drive_select_mode = 0;
+        system_mode = 0;
+        clear_screen_graphics(0x00000000);
+        draw_string("VeloOS Kernel - Bare Metal Mode Active", 50, 30, 0x00FFFFFF, 0x00000000);
+        draw_string("Kein Laufwerk ausgewaehlt.", 50, 60, 0x00FFAA00, 0x00000000);
+        gfx_cursor_x = 50; gfx_cursor_y = 120;
+        draw_string("> ", gfx_cursor_x, gfx_cursor_y, 0x00FFFFFF, 0x00000000);
+        gfx_cursor_x += 32;
+        swap_buffers();
+        return;
+    }
+    
+    if (c == '\n' || c == '\r') {
+        if (selected_drive >= 0 && selected_drive < num_drives) {
+            drive_select_mode = 0;
+            
+            if (drives[selected_drive].has_fat32) {
+                clear_screen_graphics(0x00000000);
+                draw_string("VeloOS Kernel - Bare Metal Mode Active", 50, 30, 0x00FFFFFF, 0x00000000);
+                draw_string("Laufwerk bereit.", 50, 60, 0x0000FFCC, 0x00000000);
+                gfx_cursor_x = 50; gfx_cursor_y = 120;
+                draw_string("> ", gfx_cursor_x, gfx_cursor_y, 0x00FFFFFF, 0x00000000);
+                gfx_cursor_x += 32;
+                swap_buffers();
+            } else {
+                format_mode = 1;
+                format_confirm_len = 0;
+                format_confirm[0] = '\0';
+                show_format_dialog();
+            }
+        }
+        return;
+    }
+    
+    if (c == 'w' || c == 'W') {
+        selected_drive--;
+        if (selected_drive < 0) selected_drive = num_drives - 1;
+    } else if (c == 's' || c == 'S') {
+        selected_drive++;
+        if (selected_drive >= num_drives) selected_drive = 0;
+    }
+    
+    show_drive_select_dialog();
+}
+
+void handle_format_key(char c) {
+    if (c == 0x1B) {
+        format_mode = 0;
+        selected_drive = -1;
+        system_mode = 0;
+        clear_screen_graphics(0x00000000);
+        draw_string("VeloOS Kernel - Bare Metal Mode Active", 50, 30, 0x00FFFFFF, 0x00000000);
+        draw_string("Formatierung abgebrochen.", 50, 60, 0x00FF0000, 0x00000000);
+        gfx_cursor_x = 50; gfx_cursor_y = 120;
+        draw_string("> ", gfx_cursor_x, gfx_cursor_y, 0x00FFFFFF, 0x00000000);
+        gfx_cursor_x += 32;
+        swap_buffers();
+        return;
+    }
+    
+    if (c == '\n' || c == '\r') {
+        if (strcmp(format_confirm, "YES") == 0) {
+            if (selected_drive >= 0 && selected_drive < num_drives) {
+                clear_screen_graphics(0x00000000);
+                draw_string("Formatiere Laufwerk mit FAT32...", 50, 100, 0x00FFFFFF, 0x00000000);
+                swap_buffers();
+                
+                if (format_disk_fat32(drives[selected_drive].port)) {
+                    drives[selected_drive].has_fat32 = 1;
+                    format_mode = 0;
+                    clear_screen_graphics(0x00000000);
+                    draw_string("VeloOS Kernel - Bare Metal Mode Active", 50, 30, 0x00FFFFFF, 0x00000000);
+                    draw_string("Laufwerk erfolgreich formatiert.", 50, 60, 0x0000FFCC, 0x00000000);
+                } else {
+                    selected_drive = -1;
+                    format_mode = 0;
+                    clear_screen_graphics(0x00000000);
+                    draw_string("VeloOS Kernel - Bare Metal Mode Active", 50, 30, 0x00FFFFFF, 0x00000000);
+                    draw_string("FEHLER: Formatierung fehlgeschlagen!", 50, 60, 0x00FF0000, 0x00000000);
+                }
+                gfx_cursor_x = 50; gfx_cursor_y = 120;
+                draw_string("> ", gfx_cursor_x, gfx_cursor_y, 0x00FFFFFF, 0x00000000);
+                gfx_cursor_x += 32;
+                swap_buffers();
+            }
+        } else {
+            format_confirm_len = 0;
+            format_confirm[0] = '\0';
+        }
+        return;
+    } else if (c == '\b') {
+        if (format_confirm_len > 0) {
+            format_confirm[--format_confirm_len] = '\0';
+        }
+    } else if ((c >= 'A' && c <= 'Z') && format_confirm_len < 9) {
+        format_confirm[format_confirm_len++] = c;
+        format_confirm[format_confirm_len] = '\0';
+    } else if ((c >= 'a' && c <= 'z') && format_confirm_len < 9) {
+        format_confirm[format_confirm_len++] = c - ('a' - 'A');
+        format_confirm[format_confirm_len] = '\0';
+    }
+    show_format_dialog();
+}
+
 void show_login_screen() {
-    clear_screen_graphics(0x000F0F17);
+    clear_screen_graphics(0x000A0C14);
     UINTN win_w = 480;
     UINTN win_h = 320;
     UINTN win_x = (gop_width - win_w) / 2;
@@ -277,124 +522,170 @@ void show_login_screen() {
     draw_window(win_x, win_y, win_w, win_h, "VeloOS - Secure Login");
 
     UINT32 col_u = (login_field_focus == 0) ? 0x0000FFCC : 0x00555566;
-    draw_string("Benutzername:", win_x + 20, win_y + 55, 0x00FFFFFF, 0x001E1E2E);
-    draw_filled_rect(win_x + 20, win_y + 80, 440, 35, 0x002A2A3C);
-    draw_string(login_username, win_x + 30, win_y + 88, col_u, 0x002A2A3C);
+    draw_string("Benutzername:", win_x + 20, win_y + 55, 0x00FFFFFF, 0x00181A24);
+    draw_rounded_rect_aa((int)(win_x + 20), (int)(win_y + 80), 440, 35, 6, 0x0024283B);
+    draw_string(login_username, win_x + 30, win_y + 88, col_u, 0x0024283B);
 
     UINT32 col_p = (login_field_focus == 1) ? 0x0000FFCC : 0x00555566;
-    draw_string("Passwort:", win_x + 20, win_y + 135, 0x00FFFFFF, 0x001E1E2E);
-    draw_filled_rect(win_x + 20, win_y + 160, 440, 35, 0x002A2A3C);
+    draw_string("Passwort:", win_x + 20, win_y + 135, 0x00FFFFFF, 0x00181A24);
+    draw_rounded_rect_aa((int)(win_x + 20), (int)(win_y + 160), 440, 35, 6, 0x0024283B);
     char masked[32]; int p = 0; while(login_password[p]) { masked[p++] = '*'; } masked[p] = '\0';
-    draw_string(masked, win_x + 30, win_y + 168, col_p, 0x002A2A3C);
+    draw_string(masked, win_x + 30, win_y + 168, col_p, 0x0024283B);
 
-    UINT32 btn_bg = (login_field_focus == 2) ? 0x0000FF00 : 0x00007ACC;
-    draw_filled_rect(win_x + 140, win_y + 225, 200, 40, btn_bg);
+    UINT32 btn_bg = (login_field_focus == 2) ? 0x0000FF00 : 0x001B62D6;
+    draw_rounded_rect_aa((int)(win_x + 140), (int)(win_y + 225), 200, 40, 6, btn_bg);
     draw_string("Anmelden", win_x + 180, win_y + 236, 0x00000000, btn_bg);
 
-    draw_string("[TAB] Wechseln | [ENTER] OK | [ESC] Shell", win_x + 30, win_y + 285, 0x00777788, 0x001E1E2E);
+    draw_string("[TAB] Wechseln | [ENTER] OK | [ESC] Shell", win_x + 30, win_y + 285, 0x00777788, 0x00181A24);
 
     if (login_error) {
-        draw_string("Falscher User oder Pass!", win_x + 25, win_y + 10, 0x00FF0000, 0x00007ACC);
+        draw_string("Falscher User oder Pass!", win_x + 25, win_y + 10, 0x00FF0000, 0x000E429C);
     }
+    swap_buffers();
 }
 
-// --- ACCOUNT SETUP WIZARD (Modus 2) ---
 void show_account_creator_ui() {
-    clear_screen_graphics(0x000F0F17);
+    clear_screen_graphics(0x000A0C14);
     UINTN win_w = 480;
     UINTN win_h = 320;
     UINTN win_x = (gop_width - win_w) / 2;
     UINTN win_y = (gop_height - win_h) / 2;
 
     draw_window(win_x, win_y, win_w, win_h, "VeloOS - Account Setup Wizard");
+    draw_string("Ersten Administrator anlegen:", win_x + 20, win_y + 50, 0x0000FFCC, 0x00181A24);
     
-    draw_string("Ersten Administrator anlegen:", win_x + 20, win_y + 50, 0x0000FFCC, 0x001E1E2E);
-    
-    draw_string("Username:", win_x + 20, win_y + 90, 0x00FFFFFF, 0x001E1E2E);
-    draw_filled_rect(win_x + 20, win_y + 115, 440, 30, 0x002A2A3C);
-    draw_string(ui_username, win_x + 30, win_y + 121, 0x00FFFFFF, 0x002A2A3C);
+    draw_string("Username:", win_x + 20, win_y + 90, 0x00FFFFFF, 0x00181A24);
+    draw_rounded_rect_aa((int)(win_x + 20), (int)(win_y + 115), 440, 30, 6, 0x0024283B);
+    draw_string(ui_username, win_x + 30, win_y + 121, 0x00FFFFFF, 0x0024283B);
 
-    draw_string("Password:", win_x + 20, win_y + 160, 0x00FFFFFF, 0x001E1E2E);
-    draw_filled_rect(win_x + 20, win_y + 185, 440, 30, 0x002A2A3C);
+    draw_string("Password:", win_x + 20, win_y + 160, 0x00FFFFFF, 0x00181A24);
+    draw_rounded_rect_aa((int)(win_x + 20), (int)(win_y + 185), 440, 30, 6, 0x0024283B);
     char masked[32]; int p = 0; while(ui_password[p]) { masked[p++] = '*'; } masked[p] = '\0';
-    draw_string(masked, win_x + 30, win_y + 191, 0x00FFFFFF, 0x002A2A3C);
+    draw_string(masked, win_x + 30, win_y + 191, 0x00FFFFFF, 0x0024283B);
 
-    UINT32 btn_bg = (ui_field_focus == 2) ? 0x0000FF00 : 0x00007ACC;
-    draw_filled_rect(win_x + 140, win_y + 235, 200, 40, btn_bg);
+    UINT32 btn_bg = (ui_field_focus == 2) ? 0x0000FF00 : 0x001B62D6;
+    draw_rounded_rect_aa((int)(win_x + 140), (int)(win_y + 235), 200, 40, 6, btn_bg);
     draw_string("Speichern & Disk", win_x + 160, win_y + 245, 0x00000000, btn_bg);
-    draw_string("[ESC] Abbrechen zur Shell", win_x + 120, win_y + 285, 0x00777788, 0x001E1E2E);
-}
-
-// --- DESKTOP (Modus 3) ---
-void show_desktop() {
-    clear_screen_graphics(0x0011111B);
-
-    UINTN taskbar_h = 45;
-    draw_filled_rect(0, gop_height - taskbar_h, gop_width, taskbar_h, 0x00181825);
-    
-    UINT32 start_bg = desktop_menu_open ? 0x0000FFCC : 0x00007ACC;
-    draw_filled_rect(10, gop_height - 38, 110, 31, start_bg);
-    draw_string("[F1] Start", 25, gop_height - 31, 0x00000000, start_bg);
-
-    draw_string("Shortcuts: [F1] Startmenue | [ESC] Logout zur Shell", gop_width - 450, gop_height - 31, 0x00AAAAAA, 0x00181825);
-
-    UINTN win_w = 600;
-    UINTN win_h = 340;
-    UINTN win_x = (gop_width - win_w) / 2;
-    UINTN win_y = (gop_height - win_h) / 2 - 20;
-
-    draw_window(win_x, win_y, win_w, win_h, "VeloOS Control Center - System Dashboard");
-    draw_string("Status: Online, authentifiziert & FAT32 Storage aktiv.", win_x + 20, win_y + 55, 0x0000FFCC, 0x001E1E2E);
-    draw_string("Benutzer: Erfolgreich eingeloggt (Disk-Persistent)", win_x + 20, win_y + 90, 0x00FFFFFF, 0x001E1E2E);
-
-    if (desktop_menu_open) {
-        UINTN menu_w = 200;
-        UINTN menu_h = 140;
-        UINTN menu_x = 10;
-        UINTN menu_y = gop_height - taskbar_h - menu_h - 5;
-
-        draw_filled_rect(menu_x + 4, menu_y + 4, menu_w, menu_h, 0x00050508);
-        draw_filled_rect(menu_x, menu_y, menu_w, menu_h, 0x00222233);
-        
-        UINT32 c1 = (desktop_menu_focus == 1) ? 0x00007ACC : 0x00222233;
-        draw_filled_rect(menu_x + 5, menu_y + 52, menu_w - 10, 32, c1);
-        draw_string("  Logout", menu_x + 10, menu_y + 60, 0x00FFFFFF, c1);
-    }
+    draw_string("[ESC] Abbrechen zur Shell", win_x + 120, win_y + 285, 0x00777788, 0x00181A24);
+    swap_buffers();
 }
 
 void perform_exit_boot_services() {
     if (is_bare_metal) return;
 
     mmap.MapSize = 0;
-    g_st->BootServices->GetMemoryMap(&mmap.MapSize, NULL, &mmap.MapKey, &mmap.DescriptorSize, &mmap.DescriptorVersion);
-    mmap.MapSize += 1024;
-    VOID* temp_map_buffer = NULL;
-    g_st->BootServices->AllocatePool(EfiLoaderData, mmap.MapSize, &temp_map_buffer);
-    mmap.Map = (EFI_MEMORY_DESCRIPTOR*)temp_map_buffer;
+    EFI_STATUS status = g_st->BootServices->GetMemoryMap(
+        &mmap.MapSize, NULL, &mmap.MapKey,
+        &mmap.DescriptorSize, &mmap.DescriptorVersion);
 
-    if (g_st->BootServices->GetMemoryMap(&mmap.MapSize, mmap.Map, &mmap.MapKey, &mmap.DescriptorSize, &mmap.DescriptorVersion) != EFI_SUCCESS) return;
-    if (g_st->BootServices->ExitBootServices(g_image_handle, mmap.MapKey) != EFI_SUCCESS) return;
+    if (status != EFI_BUFFER_TOO_SMALL) return;
 
-    is_bare_metal = 1;
+    mmap.MapSize += 2 * mmap.DescriptorSize;
 
-    if (g_ahci_abar != 0) {
-        init_ahci(g_ahci_abar);
-        typedef volatile struct { UINT32 r[16]; } HBA_PORT;
-        typedef volatile struct { UINT32 cap; UINT32 ghc; UINT32 is; UINT32 pi; UINT32 vs; UINT8 rsv[116]; UINT8 v[96]; HBA_PORT ports[32]; } HBA_MEM;
-        HBA_MEM *hba = (HBA_MEM*)g_ahci_abar;
-        for (int i = 0; i < 32; i++) {
-            if (hba->pi & (1 << i)) { active_ahci_port = (void*)&hba->ports[i]; break; }
-        }
-        if (active_ahci_port) fat32_init(active_ahci_port);
+    VOID *map_buffer = NULL;
+    status = g_st->BootServices->AllocatePool(
+        EfiLoaderData, mmap.MapSize, &map_buffer);
+    if (status != EFI_SUCCESS || !map_buffer) return;
+
+    mmap.Map = (EFI_MEMORY_DESCRIPTOR *)map_buffer;
+
+    status = g_st->BootServices->GetMemoryMap(
+        &mmap.MapSize, mmap.Map, &mmap.MapKey,
+        &mmap.DescriptorSize, &mmap.DescriptorVersion);
+    if (status != EFI_SUCCESS) return;
+
+    status = g_st->BootServices->ExitBootServices(g_image_handle, mmap.MapKey);
+
+    if (status == EFI_INVALID_PARAMETER) {
+        mmap.MapSize = 0;
+        status = g_st->BootServices->GetMemoryMap(
+            &mmap.MapSize, NULL, &mmap.MapKey,
+            &mmap.DescriptorSize, &mmap.DescriptorVersion);
+        if (status != EFI_BUFFER_TOO_SMALL) return;
+
+        mmap.MapSize += 2 * mmap.DescriptorSize;
+        status = g_st->BootServices->GetMemoryMap(
+            &mmap.MapSize, mmap.Map, &mmap.MapKey,
+            &mmap.DescriptorSize, &mmap.DescriptorVersion);
+        if (status != EFI_SUCCESS) return;
+
+        status = g_st->BootServices->ExitBootServices(
+            g_image_handle, mmap.MapKey);
     }
 
+    if (status != EFI_SUCCESS) return;
+
+    is_bare_metal = 1;
     system_mode = 0;
+    logged_in = 0;
+    selected_drive = -1;
+    num_drives = 0;
+
+    init_keyboard_bare_metal();
+
     clear_screen_graphics(0x00000000);
-    draw_string("VeloOS Kernel - Bare Metal Mode Active", 50, 30, 0x00FFFFFF, 0x00000000);
-    draw_string("Tippe 'help' fuer eine Liste aller Befehle.", 50, 60, 0x0000FFCC, 0x00000000);
-    gfx_cursor_x = 50; gfx_cursor_y = 120;
-    draw_string("> ", gfx_cursor_x, gfx_cursor_y, 0x00FFFFFF, 0x00000000);
-    gfx_cursor_x += 32;
+    draw_string("Scanne alle PCI Speicher-Controller...", 50, 30, 0x00FFFFFF, 0x00000000);
+    swap_buffers();
+
+    init_ahci(0);
+    
+    int port_count = ahci_get_port_count();
+    
+    for (int i = 0; i < port_count && num_drives < MAX_DRIVES; i++) {
+        AHCI_PORT_INFO *info = ahci_get_port_info(i);
+        if (!info || !info->active) continue;
+        
+        drives[num_drives].port = info->port_addr;
+        drives[num_drives].port_number = info->port_number;
+        drives[num_drives].sector_count = info->sector_count;
+        
+        UINT64 total_bytes = info->sector_count * 512;
+        drives[num_drives].size_mb = (total_bytes > 0) ? (total_bytes / (1024 * 1024)) : 64;
+        
+        drives[num_drives].has_fat32 = fat32_init(info->port_addr);
+        
+        int pos = 0;
+        drives[num_drives].label[pos++] = 'D';
+        drives[num_drives].label[pos++] = 'r';
+        drives[num_drives].label[pos++] = 'i';
+        drives[num_drives].label[pos++] = 'v';
+        drives[num_drives].label[pos++] = 'e';
+        drives[num_drives].label[pos++] = ' ';
+        drives[num_drives].label[pos++] = '0' + (char)num_drives;
+        drives[num_drives].label[pos] = '\0';
+        
+        num_drives++;
+    }
+
+    if (num_drives == 0) {
+        clear_screen_graphics(0x00000000);
+        draw_string("VeloOS Kernel - Bare Metal Mode Active", 50, 30, 0x00FFFFFF, 0x00000000);
+        draw_string("WARNUNG: Keine Laufwerke gefunden.", 50, 60, 0x00FFAA00, 0x00000000);
+        gfx_cursor_x = 50; gfx_cursor_y = 120;
+        draw_string("> ", gfx_cursor_x, gfx_cursor_y, 0x00FFFFFF, 0x00000000);
+        gfx_cursor_x += 32;
+        swap_buffers();
+    } else if (num_drives == 1) {
+        selected_drive = 0;
+        if (drives[0].has_fat32) {
+            clear_screen_graphics(0x00000000);
+            draw_string("VeloOS Kernel - Bare Metal Mode Active", 50, 30, 0x00FFFFFF, 0x00000000);
+            draw_string("Laufwerk bereit.", 50, 60, 0x0000FFCC, 0x00000000);
+            gfx_cursor_x = 50; gfx_cursor_y = 120;
+            draw_string("> ", gfx_cursor_x, gfx_cursor_y, 0x00FFFFFF, 0x00000000);
+            gfx_cursor_x += 32;
+            swap_buffers();
+        } else {
+            format_mode = 1;
+            format_confirm_len = 0;
+            format_confirm[0] = '\0';
+            show_format_dialog();
+        }
+    } else {
+        selected_drive = 0;
+        drive_select_mode = 1;
+        show_drive_select_dialog();
+    }
 }
 
 void execute_command() {
@@ -411,20 +702,22 @@ void execute_command() {
         draw_string("> ", gfx_cursor_x, gfx_cursor_y, 0x00FFFFFF, 0x00000000);
         gfx_cursor_x += 32;
         command_length = 0;
+        swap_buffers();
         return;
     }
     else if (strcmp(command_buffer, "login") == 0) {
         if (!is_bare_metal) {
             draw_string("Erst mit 'exit' in den Bare-Metal-Modus wechseln!", gfx_cursor_x, gfx_cursor_y, 0x00FF0000, 0x00000000);
-        } else if (!check_account_exists()) {
-            draw_string("Fehler: Kein Account vorhanden! Nutze 'account -create -ui'", gfx_cursor_x, gfx_cursor_y, 0x00FF0000, 0x00000000);
+        } else if (selected_drive < 0 || !check_account_exists()) {
+            draw_string("Fehler: Kein Account auf Disk vorhanden.", gfx_cursor_x, gfx_cursor_y, 0x00FF0000, 0x00000000);
         } else {
             system_mode = 1;
             login_field_focus = 0;
             login_error = 0;
             __builtin_memset(login_username, 0, 32);
             __builtin_memset(login_password, 0, 32);
-            login_len_u = 0; login_len_p = 0;
+            login_len_u = 0;
+            login_len_p = 0;
             show_login_screen();
             command_length = 0;
             return;
@@ -433,25 +726,17 @@ void execute_command() {
     else if (strcmp(command_buffer, "desktop") == 0) {
         if (!is_bare_metal) {
             draw_string("Erst mit 'exit' in den Bare-Metal-Modus wechseln!", gfx_cursor_x, gfx_cursor_y, 0x00FF0000, 0x00000000);
+        } else if (!check_account_exists()) {
+            draw_string("Fehler: Kein Account vorhanden. Nutze 'create account'.", gfx_cursor_x, gfx_cursor_y, 0x00FF0000, 0x00000000);
+        } else if (!logged_in) {
+            draw_string("Fehler: Nicht eingeloggt. Nutze zuerst 'login'.", gfx_cursor_x, gfx_cursor_y, 0x00FF0000, 0x00000000);
         } else {
-            // SICHERHEITSPRÜFUNG: Ohne Account ODER Login kein Desktop!
-            if (!check_account_exists()) {
-                draw_string("Fehler: Kein Account vorhanden! Nutze 'account -create -ui'", gfx_cursor_x, gfx_cursor_y, 0x00FF0000, 0x00000000);
-            } else {
-                // Erzwinge Login-Screen vor dem Desktop, wenn nicht eingeloggt
-                system_mode = 1;
-                login_field_focus = 0;
-                login_error = 0;
-                __builtin_memset(login_username, 0, 32);
-                __builtin_memset(login_password, 0, 32);
-                login_len_u = 0; login_len_p = 0;
-                show_login_screen();
-                command_length = 0;
-                return;
-            }
+            desktop_start();
+            command_length = 0;
+            return;
         }
     }
-    else if (strcmp(command_buffer, "account -create -ui") == 0) {
+    else if (strcmp(command_buffer, "create account") == 0) {
         if (!is_bare_metal) {
             draw_string("Erst mit 'exit' in den Bare-Metal-Modus wechseln!", gfx_cursor_x, gfx_cursor_y, 0x00FF0000, 0x00000000);
         } else if (check_account_exists()) {
@@ -469,10 +754,12 @@ void execute_command() {
     }
     else if (strcmp(command_buffer, "shutdown") == 0) {
         draw_string("Fahre System herunter...", gfx_cursor_x, gfx_cursor_y, 0x00FFAA00, 0x00000000);
+        swap_buffers();
         system_shutdown();
     }
     else if (strcmp(command_buffer, "reboot") == 0) {
         draw_string("Starte System neu...", gfx_cursor_x, gfx_cursor_y, 0x00FFAA00, 0x00000000);
+        swap_buffers();
         system_reboot();
     }
     else if (strcmp(command_buffer, "exit") == 0) {
@@ -480,13 +767,14 @@ void execute_command() {
             draw_string("Bereits im Bare-Metal-Modus!", gfx_cursor_x, gfx_cursor_y, 0x00FF0000, 0x00000000);
         } else {
             draw_string("Wechsle in den Bare-Metal-Modus...", gfx_cursor_x, gfx_cursor_y, 0x00FFFFFF, 0x00000000);
+            swap_buffers();
             perform_exit_boot_services();
             command_length = 0;
             return;
         }
     }
     else if (strcmp(command_buffer, "help") == 0) {
-        draw_string("Befehle: exit, login, desktop, account -create -ui,", gfx_cursor_x, gfx_cursor_y, 0x00FFFF00, 0x00000000);
+        draw_string("Befehle: exit, create account, login, desktop,", gfx_cursor_x, gfx_cursor_y, 0x00FFFF00, 0x00000000);
         gfx_cursor_y += 24;
         draw_string("         shutdown, reboot, clear, help", gfx_cursor_x, gfx_cursor_y, 0x00FFFF00, 0x00000000);
     } else {
@@ -498,11 +786,11 @@ void execute_command() {
     draw_string("> ", gfx_cursor_x, gfx_cursor_y, 0x00FFFFFF, 0x00000000);
     gfx_cursor_x += 32;
     command_length = 0;
+    swap_buffers();
 }
 
-// Handler für Login-Screen (mit fixem ESC)
 void handle_login_key(char c) {
-    if (c == 0x1B) { // ESC
+    if (c == 0x1B) {
         system_mode = 0;
         clear_screen_graphics(0x00000000);
         draw_string("VeloOS Kernel - Bare Metal Mode Active", 50, 30, 0x00FFFFFF, 0x00000000);
@@ -510,6 +798,7 @@ void handle_login_key(char c) {
         gfx_cursor_x = 50; gfx_cursor_y = 120;
         draw_string("> ", gfx_cursor_x, gfx_cursor_y, 0x00FFFFFF, 0x00000000);
         gfx_cursor_x += 32;
+        swap_buffers();
         return;
     }
     if (c == '\t') {
@@ -519,10 +808,17 @@ void handle_login_key(char c) {
             login_field_focus++;
         } else {
             if (verify_login(login_username, login_password)) {
-                // Sensible RAM-Daten sofort löschen
                 __builtin_memset(login_password, 0, 32);
-                system_mode = 3; 
-                show_desktop();
+                logged_in = 1;
+                system_mode = 0;
+                clear_screen_graphics(0x00000000);
+                draw_string("VeloOS Kernel - Bare Metal Mode Active", 50, 30, 0x00FFFFFF, 0x00000000);
+                draw_string("Login erfolgreich. Tippe 'desktop' zum Starten des Desktops.", 50, 60, 0x0000FFCC, 0x00000000);
+                gfx_cursor_x = 50;
+                gfx_cursor_y = 120;
+                draw_string("> ", gfx_cursor_x, gfx_cursor_y, 0x00FFFFFF, 0x00000000);
+                gfx_cursor_x += 32;
+                swap_buffers();
                 return;
             } else {
                 login_error = 1;
@@ -538,9 +834,8 @@ void handle_login_key(char c) {
     show_login_screen();
 }
 
-// Handler für Account Setup Wizard (mit ESC-Abbruch)
 void handle_account_ui_key(char c) {
-    if (c == 0x1B) { // ESC - Wizard abbrechen
+    if (c == 0x1B) {
         system_mode = 0;
         clear_screen_graphics(0x00000000);
         draw_string("VeloOS Kernel - Bare Metal Mode Active", 50, 30, 0x00FFFFFF, 0x00000000);
@@ -548,6 +843,7 @@ void handle_account_ui_key(char c) {
         gfx_cursor_x = 50; gfx_cursor_y = 120;
         draw_string("> ", gfx_cursor_x, gfx_cursor_y, 0x00FFFFFF, 0x00000000);
         gfx_cursor_x += 32;
+        swap_buffers();
         return;
     }
     if (c == '\t') {
@@ -556,18 +852,22 @@ void handle_account_ui_key(char c) {
         if (ui_field_focus < 2) {
             ui_field_focus++;
         } else {
-            save_account_to_disk(ui_username, ui_password);
-            // Sensible Daten aus dem RAM löschen
+            int saved = save_account_to_disk(ui_username, ui_password);
             __builtin_memset(ui_password, 0, 32);
             __builtin_memset(ui_username, 0, 32);
-            
-            system_mode = 0; 
+
+            system_mode = 0;
             clear_screen_graphics(0x00000000);
             draw_string("VeloOS Kernel - Bare Metal Mode Active", 50, 30, 0x00FFFFFF, 0x00000000);
-            draw_string("Account erfolgreich auf Disk erstellt & gesichert!", 50, 60, 0x0000FFCC, 0x00000000);
+            if (saved) {
+                draw_string("Account erfolgreich auf Disk gespeichert.", 50, 60, 0x0000FFCC, 0x00000000);
+            } else {
+                draw_string("FEHLER: Account konnte nicht auf Disk gespeichert werden.", 50, 60, 0x00FF0000, 0x00000000);
+            }
             gfx_cursor_x = 50; gfx_cursor_y = 120;
             draw_string("> ", gfx_cursor_x, gfx_cursor_y, 0x00FFFFFF, 0x00000000);
             gfx_cursor_x += 32;
+            swap_buffers();
             return;
         }
     } else if (c == '\b') {
@@ -580,51 +880,6 @@ void handle_account_ui_key(char c) {
     show_account_creator_ui();
 }
 
-// Handler für den Desktop (inklusive F1 Startmenü & ESC Logout)
-void handle_desktop_key(char c) {
-    if (c == 0x1B) { // ESC -> Logout zur Shell
-        desktop_menu_open = 0;
-        system_mode = 0;
-        clear_screen_graphics(0x00000000);
-        draw_string("VeloOS Kernel - Bare Metal Mode Active", 50, 30, 0x00FFFFFF, 0x00000000);
-        draw_string("Abgemeldet. Zurueck in der Shell.", 50, 60, 0x0000FFCC, 0x00000000);
-        gfx_cursor_x = 50; gfx_cursor_y = 120;
-        draw_string("> ", gfx_cursor_x, gfx_cursor_y, 0x00FFFFFF, 0x00000000);
-        gfx_cursor_x += 32;
-        return;
-    }
-    
-    // Prüfe auf Funktionstaste F1 (Scan-Code / ASCII-Mapping je nach keyboard.h, oft blockiert oder als Sonderzeichen abgefangen)
-    // Wenn dein Keyboard-Treiber F1 als spezifisches Zeichen oder via Scan-Code liefert, hier einbauen. 
-    // Falls F1 als ASCII 0 (oder ein spezieller Key) reinkommt:
-    if (c == 0x3B || c == 0xF1) { // F1 Key (je nach Implementierung in keyboard.h)
-        desktop_menu_open = !desktop_menu_open;
-        show_desktop();
-        return;
-    }
-
-    if (c == 0x09) { // TAB
-        if (desktop_menu_open) desktop_menu_focus = (desktop_menu_focus + 1) % 2;
-    } else if (c == '\n' || c == '\r') {
-        if (desktop_menu_open) {
-            if (desktop_menu_focus == 1 || desktop_menu_focus == 0) { 
-                desktop_menu_open = 0;
-                system_mode = 0;
-                clear_screen_graphics(0x00000000);
-                draw_string("VeloOS Kernel - Bare Metal Mode Active", 50, 30, 0x00FFFFFF, 0x00000000);
-                draw_string("Abgemeldet.", 50, 60, 0x0000FFCC, 0x00000000);
-                gfx_cursor_x = 50; gfx_cursor_y = 120;
-                draw_string("> ", gfx_cursor_x, gfx_cursor_y, 0x00FFFFFF, 0x00000000);
-                gfx_cursor_x += 32;
-                return;
-            }
-        } else {
-            desktop_menu_open = 1;
-        }
-    }
-    show_desktop();
-}
-
 void handle_shell_key(char c) {
     if (c == '\n' || c == '\r') execute_command();
     else if (c == '\b') {
@@ -632,12 +887,14 @@ void handle_shell_key(char c) {
             command_length--;
             gfx_cursor_x -= 16;
             draw_char(' ', gfx_cursor_x, gfx_cursor_y, 0x00FFFFFF, 0x00000000);
+            swap_buffers();
         }
     } else if (c >= 32 && c <= 126) {
         if (command_length < 61) {
             command_buffer[command_length++] = c;
             draw_char(c, gfx_cursor_x, gfx_cursor_y, 0x00FFFFFF, 0x00000000);
             gfx_cursor_x += 16;
+            swap_buffers();
         }
     }
 }
@@ -648,23 +905,32 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     InitializeLib(ImageHandle, SystemTable);
 
     init_gop();
-    discover_ahci_bar_direct();
     clear_screen_graphics(0x00000000);
 
     draw_string("VeloOS Bootloader aktiv. Tippe 'exit' fuer Bare-Metal.", 50, 50, 0x0000FFCC, 0x00000000);
     gfx_cursor_x = 50; gfx_cursor_y = 100;
     draw_string("> ", gfx_cursor_x, gfx_cursor_y, 0x00FFFFFF, 0x00000000);
     gfx_cursor_x += 32;
+    swap_buffers();
 
     init_keyboard();
 
     while (1) {
         char ascii = poll_keyboard_ascii();
         if (ascii != 0) {
-            if (system_mode == 1) handle_login_key(ascii);         
-            else if (system_mode == 2) handle_account_ui_key(ascii); 
-            else if (system_mode == 3) handle_desktop_key(ascii);    
-            else handle_shell_key(ascii);                            
+            if (drive_select_mode) {
+                handle_drive_select_key(ascii);
+            } else if (format_mode) {
+                handle_format_key(ascii);
+            } else if (system_mode == 1) {
+                handle_login_key(ascii);
+            } else if (system_mode == 2) {
+                handle_account_ui_key(ascii);
+            } else if (system_mode == 3) {
+                desktop_handle_key(ascii);
+            } else {
+                handle_shell_key(ascii);
+            }
         }
     }
     return EFI_SUCCESS;
