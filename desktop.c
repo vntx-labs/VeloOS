@@ -1,4 +1,4 @@
-// desktop.c - Mathematisch gerenderter Desktop mit Scanline-Alignment & Subpixel-Anti-Aliasing
+// desktop.c - VeloOS Desktop mit automatischer Datumserkennung & MESZ/Sommerzeit-Berechnung
 #include <efi.h>
 #include <efilib.h>
 #include "desktop.h"
@@ -6,6 +6,9 @@
 #include "wm.h"
 #include "ahci.h"
 #include "fat32.h"
+#include "mouse.h"
+#include "calc.h"
+#include "net.h"
 
 extern UINTN gop_width;
 extern UINTN gop_height;
@@ -13,38 +16,32 @@ extern UINTN gfx_cursor_x;
 extern UINTN gfx_cursor_y;
 extern int system_mode;
 extern int logged_in;
+extern UINT32 *g_backbuffer;
+extern UINT32 *g_wall_buffer;
 
 void put_pixel(UINTN x, UINTN y, UINT32 color);
-void draw_string(const char* str, UINTN x, UINTN y, UINT32 fg_color, UINT32 bg_color);
 void draw_filled_rect(UINTN start_x, UINTN start_y, UINTN width, UINTN height, UINT32 color);
+void draw_string(const char* str, UINTN x, UINTN y, UINT32 fg_color, UINT32 bg_color);
 void clear_screen_graphics(UINT32 color);
 void swap_buffers(void);
+void swap_buffers_rect(int rx, int ry, int rw, int rh);
+void system_shutdown(void);
+void system_reboot(void);
 
 static int desktop_menu_open = 0;
 static int start_menu_selected = 0;
+static int last_second = -1;
+static int last_synced_state = 0;
+static int last_mouse_x = -1;
+static int last_mouse_y = -1;
 
-#define START_MENU_ITEMS 5
+#define MAX_DISK_APPS 24
+static char disk_apps[MAX_DISK_APPS][32];
+static int disk_app_count = 0;
 
-static const char* start_menu_labels[START_MENU_ITEMS] = {
-    "1. Control Center",
-    "2. Taschenrechner",
-    "3. Matrix Terminal",
-    "4. Storage Manager",
-    "5. Abmelden (Shell)"
-};
-
-static const char* dashboard_text_lines[] = {
-    "VeloOS System Control Center - Dashboard",
-    "Status: Online, authentifiziert & FAT32 Storage aktiv.",
-    "Benutzer: Angemeldet (Disk-Persistent auf SATA)",
-    "Speicher: 2 Laufwerke initialisiert & betriebsbereit.",
-    "----------------------------------------------------------",
-    "[F1]  Startmenue oeffnen / schliessen",
-    "[TAB] Naechstes Fenster fokussieren",
-    "[M]   Aktives Fenster minimieren",
-    "[X]   Aktives Fenster schliessen",
-    "[ESC] Desktop beenden -> Logout zur Shell"
-};
+static UINT32 g_wall_src_w = 0;
+static UINT32 g_wall_src_h = 0;
+static int g_wall_loaded = 0;
 
 static inline unsigned char inb_cmos(unsigned short port) {
     unsigned char res;
@@ -55,260 +52,481 @@ static inline void outb_cmos(unsigned short port, unsigned char val) {
     __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
 }
 
-static void get_rtc_time(int *h, int *m, int *s) {
+/* Liest Uhrzeit und volles Datum aus dem CMOS RTC */
+static void get_rtc_full_datetime(int *year, int *month, int *day, int *h, int *m, int *s) {
     outb_cmos(0x70, 0x00); *s = inb_cmos(0x71);
     outb_cmos(0x70, 0x02); *m = inb_cmos(0x71);
     outb_cmos(0x70, 0x04); *h = inb_cmos(0x71);
+    outb_cmos(0x70, 0x07); *day = inb_cmos(0x71);
+    outb_cmos(0x70, 0x08); *month = inb_cmos(0x71);
+    outb_cmos(0x70, 0x09); *year = inb_cmos(0x71);
 
+    // BCD zu Binär konvertieren
     *s = (*s & 0x0F) + ((*s >> 4) * 10);
     *m = (*m & 0x0F) + ((*m >> 4) * 10);
     *h = (*h & 0x0F) + ((*h >> 4) * 10);
+    *day = (*day & 0x0F) + ((*day >> 4) * 10);
+    *month = (*month & 0x0F) + ((*month >> 4) * 10);
+    *year = (*year & 0x0F) + ((*year >> 4) * 10);
+    if (*year < 100) *year += 2000;
 }
 
-/* 1. Mathematischer Linearer Farbverlauf für den Desktop */
-static void draw_gradient_background(UINT32 top_col, UINT32 bot_col) {
-    UINT32 tr = (top_col >> 16) & 0xFF, tg = (top_col >> 8) & 0xFF, tb = top_col & 0xFF;
-    UINT32 br = (bot_col >> 16) & 0xFF, bg_val = (bot_col >> 8) & 0xFF, bb = bot_col & 0xFF;
+/*
+ * Berechnet nach offizieller EU-Richtlinie, ob am gegebenen Datum Sommerzeit (MESZ) gilt
+ */
+static int is_european_summer_time(int year, int month, int day, int utc_hour) {
+    if (month < 3 || month > 10) return 0; // Nov, Dez, Jan, Feb -> Normal-/Winterzeit
+    if (month > 3 && month < 10) return 1; // Apr, Mai, Jun, Jul, Aug, Sep -> Immer Sommerzeit
 
-    for (UINTN y = 0; y < gop_height; y++) {
-        UINT32 r = tr + (UINT32)(((INT32)br - (INT32)tr) * (INT32)y / (INT32)gop_height);
-        UINT32 g = tg + (UINT32)(((INT32)bg_val - (INT32)tg) * (INT32)y / (INT32)gop_height);
-        UINT32 b = tb + (UINT32)(((INT32)bb - (INT32)tb) * (INT32)y / (INT32)gop_height);
-        UINT32 row_col = (r << 16) | (g << 8) | b;
+    // Sakamoto-Algorithmus zur Wochentagsberechnung des 31. März bzw. 31. Oktober
+    static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    int y = year;
+    if (month < 3) y--;
+    int day_of_31 = (y + y/4 - y/100 + y/400 + t[month - 1] + 31) % 7;
+    int last_sunday = 31 - day_of_31;
 
-        for (UINTN x = 0; x < gop_width; x++) {
-            put_pixel(x, y, row_col);
-        }
+    if (month == 3) { // März: Umschaltung am letzten Sonntag um 01:00 UTC
+        if (day > last_sunday) return 1;
+        if (day == last_sunday && utc_hour >= 1) return 1;
+        return 0;
+    } else { // Oktober: Umschaltung am letzten Sonntag um 01:00 UTC
+        if (day < last_sunday) return 1;
+        if (day == last_sunday && utc_hour < 1) return 1;
+        return 0;
     }
 }
 
-/* 2. Zentriertes Anti-Aliased Vektor-Logo */
-static void draw_centered_vector_logo(void) {
-    int cx = (int)gop_width / 2;
-    int cy = (int)gop_height / 2 - 20;
-
-    /* Äußerer & innerer Anti-Aliased Kreis */
-    draw_circle_aa(cx, cy, 90, 4, 0x001B62D6);
-    draw_circle_aa(cx, cy, 76, 2, 0x007AA2F7);
-
-    /* Vektor-Chevron "V" */
-    draw_line_aa(cx - 42, cy - 38, cx, cy + 42, 8, 0x0000FFCC);
-    draw_line_aa(cx, cy + 42, cx + 42, cy - 38, 8, 0x0000FFCC);
-
-    draw_line_aa(cx - 24, cy - 32, cx, cy + 18, 5, 0x007AA2F7);
-    draw_line_aa(cx, cy + 18, cx + 24, cy - 32, 5, 0x007AA2F7);
-
-    /* Logo-Text */
-    wm_draw_string_content("V E L O   O S", cx - 52, cy + 110, 1, 0x0000FFCC, 0x00000000, 0, 0, (int)gop_width, (int)gop_height);
-    wm_draw_string_content("64-Bit Bare-Metal Core", cx - 88, cy + 134, 1, 0x007AA2F7, 0x00000000, 0, 0, (int)gop_width, (int)gop_height);
-}
-
-/* 1. Dashboard Window Paint */
-static void paint_dashboard(int win_id, int cx, int cy, int cw, int ch) {
-    (void)win_id;
-    int y = cy + 4;
-    wm_draw_string_content(dashboard_text_lines[0], cx + 4, y, 1, 0x007AA2F7, 0x00141620, cx, cy, cw, ch); y += 26;
-    wm_draw_string_content(dashboard_text_lines[1], cx + 4, y, 1, 0x00C0CAF5, 0x00141620, cx, cy, cw, ch); y += 24;
-    wm_draw_string_content(dashboard_text_lines[2], cx + 4, y, 1, 0x009ECE6A, 0x00141620, cx, cy, cw, ch); y += 24;
-    wm_draw_string_content(dashboard_text_lines[3], cx + 4, y, 1, 0x00E0AF68, 0x00141620, cx, cy, cw, ch); y += 24;
-    wm_draw_string_content(dashboard_text_lines[4], cx + 4, y, 1, 0x00565F89, 0x00141620, cx, cy, cw, ch); y += 26;
-
-    for (int i = 5; i < 10; i++) {
-        UINT32 col = (i == 9) ? 0x00F7768E : 0x00C0CAF5;
-        wm_draw_string_content(dashboard_text_lines[i], cx + 4, y, 1, col, 0x00141620, cx, cy, cw, ch);
-        y += 24;
+static int str_equal_nocase(const char *a, const char *b) {
+    while (*a && *b) {
+        char ca = *a >= 'a' && *a <= 'z' ? *a - ('a' - 'A') : *a;
+        char cb = *b >= 'a' && *b <= 'z' ? *b - ('a' - 'A') : *b;
+        if (ca != cb) return 0;
+        a++; b++;
     }
+    return *a == *b;
 }
 
-/* 2. Taschenrechner Window Paint */
-static void paint_calculator(int win_id, int cx, int cy, int cw, int ch) {
-    (void)win_id;
-    wm_draw_string_content("VeloOS Schneller Taschenrechner", cx + 8, cy + 4, 1, 0x007AA2F7, 0x00141620, cx, cy, cw, ch);
-    draw_rounded_rect_aa(cx + 8, cy + 32, cw - 16, 36, 6, 0x001E2233);
-    wm_draw_string_content("10 + 2 * 5 = 20", cx + 18, cy + 42, 1, 0x009ECE6A, 0x001E2233, cx, cy, cw, ch);
+static void scan_disk_applications(void) {
+    disk_app_count = 0;
+    int port_count = ahci_get_port_count();
+    char raw_files[MAX_DISK_APPS][32];
 
-    wm_draw_string_content("Ergebnis: 20 (Gueltige Berechnung)", cx + 8, cy + 82, 1, 0x00C0CAF5, 0x00141620, cx, cy, cw, ch);
-    wm_draw_string_content("Strikte Syntax & Punkt-vor-Strich aktiv.", cx + 8, cy + 110, 1, 0x00565F89, 0x00141620, cx, cy, cw, ch);
-}
-
-/* 3. Matrix Terminal Window Paint */
-static void paint_matrix(int win_id, int cx, int cy, int cw, int ch) {
-    (void)win_id;
-    wm_draw_string_content("VeloOS Matrix Subsystem - Aktiv", cx + 8, cy + 4, 1, 0x009ECE6A, 0x00141620, cx, cy, cw, ch);
-    wm_draw_string_content("01011001 01100101 01101100 01101111", cx + 8, cy + 30, 1, 0x0073DACA, 0x00141620, cx, cy, cw, ch);
-    wm_draw_string_content("K E R N E L _ L O A D E D _ S U C C E S S", cx + 8, cy + 54, 1, 0x009ECE6A, 0x00141620, cx, cy, cw, ch);
-    wm_draw_string_content("SATA AHCI DMA Pipeline: Operational", cx + 8, cy + 78, 1, 0x007AA2F7, 0x00141620, cx, cy, cw, ch);
-}
-
-/* 4. Storage Window Paint */
-static void paint_storage(int win_id, int cx, int cy, int cw, int ch) {
-    (void)win_id;
-    int count = ahci_get_port_count();
-    wm_draw_string_content("Angeschlossene SATA Speicher-Laufwerke:", cx + 8, cy + 4, 1, 0x00E0AF68, 0x00141620, cx, cy, cw, ch);
-
-    int y = cy + 34;
-    for (int i = 0; i < count && i < 4; i++) {
-        AHCI_PORT_INFO *info = ahci_get_port_info(i);
+    for (int p = 0; p < port_count && disk_app_count < MAX_DISK_APPS; p++) {
+        AHCI_PORT_INFO *info = ahci_get_port_info(p);
         if (!info || !info->active) continue;
 
-        draw_rounded_rect_aa(cx + 8, y, cw - 16, 34, 6, 0x001E2233);
-        char port_str[64];
-        port_str[0] = 'P'; port_str[1] = 'o'; port_str[2] = 'r'; port_str[3] = 't'; port_str[4] = ' ';
-        port_str[5] = '0' + (char)info->port_number; port_str[6] = ':'; port_str[7] = ' ';
-        port_str[8] = '\0';
-        wm_draw_string_content(port_str, cx + 18, y + 8, 1, 0x007AA2F7, 0x001E2233, cx, cy, cw, ch);
-        wm_draw_string_content(info->model, cx + 90, y + 8, 1, 0x00FFFFFF, 0x001E2233, cx, cy, cw, ch);
-        y += 42;
+        int count = fat32_list_root(info->port_addr, raw_files, MAX_DISK_APPS);
+        for (int i = 0; i < count && disk_app_count < MAX_DISK_APPS; i++) {
+            if (str_equal_nocase(raw_files[i], "WALL.BIN") ||
+                str_equal_nocase(raw_files[i], "ACCOUNT.DAT") ||
+                str_equal_nocase(raw_files[i], "BOOTX64.EFI") ||
+                str_equal_nocase(raw_files[i], "KERNEL.EFI")) {
+                continue;
+            }
+
+            int len = 0;
+            while (raw_files[i][len] != '\0') len++;
+
+            if (len >= 4) {
+                const char *ext = &raw_files[i][len - 4];
+                if ((ext[0] == '.' && (ext[1] == 'B' || ext[1] == 'b') && (ext[2] == 'I' || ext[2] == 'i') && (ext[3] == 'N' || ext[3] == 'n')) ||
+                    (ext[0] == '.' && (ext[1] == 'A' || ext[1] == 'a') && (ext[2] == 'P' || ext[2] == 'p') && (ext[3] == 'P' || ext[3] == 'p'))) {
+                    
+                    int c = 0;
+                    while (raw_files[i][c] && c < 31) {
+                        disk_apps[disk_app_count][c] = raw_files[i][c];
+                        c++;
+                    }
+                    disk_apps[disk_app_count][c] = '\0';
+                    disk_app_count++;
+                }
+            }
+        }
     }
 }
 
-/* 4. Painter’s Algorithm Render-Loop mit Scanline-Alignment */
-static void show_desktop(void) {
-    /* Step A: Linearer Hintergrund-Farbverlauf */
-    draw_gradient_background(0x00060C1A, 0x000E2244);
+static void load_wallpaper_from_disk(void) {
+    if (g_wall_loaded || g_wall_buffer == NULL) return;
 
-    /* Step B: Zentriertes Vektor-Logo mit Anti-Aliasing */
-    draw_centered_vector_logo();
+    int port_count = ahci_get_port_count();
+    for (int p = 0; p < port_count; p++) {
+        AHCI_PORT_INFO *info = ahci_get_port_info(p);
+        if (!info || !info->active) continue;
 
-    /* Step C: Obere Statusleiste */
-    draw_rounded_rect_gradient(0, 0, (int)gop_width, 30, 0, 0x00181A24, 0x0010121A);
-    wm_draw_string_content("VeloOS 64-Bit Desktop Environment", 16, 7, 1, 0x007AA2F7, 0x0010121A, 0, 0, (int)gop_width, 30);
-    wm_draw_string_content("[F1] Start | [TAB] Fenster | [ESC] Logout", (int)gop_width - 350, 7, 1, 0x00A9B1D6, 0x0010121A, 0, 0, (int)gop_width, 30);
+        UINT32 file_header[2];
+        int read_hdr = fat32_read_file(info->port_addr, "WALL.BIN", file_header, 8);
+        if (read_hdr >= 8) {
+            g_wall_src_w = file_header[0];
+            g_wall_src_h = file_header[1];
 
-    /* Step D: Window Manager Fenster */
-    wm_render_all();
+            if (g_wall_src_w > 0 && g_wall_src_h > 0 && 
+                g_wall_src_w <= 1920 && g_wall_src_h <= 1080) {
+                
+                UINT32 total_pixels = g_wall_src_w * g_wall_src_h;
+                UINT32 read_bytes = (total_pixels + 2) * sizeof(UINT32);
 
-    /* Step E: Untere Taskbar über die gesamte Pitch-Breite */
-    UINTN taskbar_h = 44;
-    UINTN taskbar_y = gop_height - taskbar_h;
-    draw_rounded_rect_gradient(0, (int)taskbar_y, (int)gop_width, (int)taskbar_h, 0, 0x00181A24, 0x000E1017);
+                int bytes = fat32_read_file(info->port_addr, "WALL.BIN", (void*)g_wall_buffer, read_bytes);
+                if (bytes > 8) {
+                    for (UINT32 k = 0; k < total_pixels; k++) {
+                        g_wall_buffer[k] = g_wall_buffer[k + 2];
+                    }
+                    g_wall_loaded = 1;
+                    return;
+                }
+            }
+        }
+    }
+}
 
-    /* Start Button */
-    UINT32 sb_top = desktop_menu_open ? 0x0000E5FF : 0x001B62D6;
-    UINT32 sb_bot = desktop_menu_open ? 0x000088CC : 0x000E429C;
-    draw_rounded_rect_gradient(10, (int)taskbar_y + 6, 100, 32, 6, sb_top, sb_bot);
-    wm_draw_string_content("[Start]", 30, (int)taskbar_y + 14, 1, 0x00FFFFFF, sb_bot, 0, 0, (int)gop_width, (int)gop_height);
-
-    /* Offene Fenster Tabs */
-    int tab_x = 120;
-    for (int i = 0; i < MAX_WINDOWS; i++) {
-        Window *win = wm_get_window(i);
-        if (!win || win->is_closed) continue;
-
-        UINT32 tb_top = win->is_active ? 0x001B62D6 : 0x0024283B;
-        UINT32 tb_bot = win->is_active ? 0x000E429C : 0x00181A24;
-        draw_rounded_rect_gradient(tab_x, (int)taskbar_y + 6, 160, 32, 6, tb_top, tb_bot);
-        wm_draw_string_content(win->title, tab_x + 12, (int)taskbar_y + 14, 1, 0x00FFFFFF, tb_bot, tab_x, (int)taskbar_y, 160, 40);
-        tab_x += 170;
+static void draw_desktop_background(void) {
+    if (!g_wall_loaded) {
+        load_wallpaper_from_disk();
     }
 
-    /* System Tray: Exakte Verankerung an der rechten Kante */
-    int right_margin = 12;
-    int power_w = 80;
-    int power_x = (int)gop_width - power_w - right_margin;
-
-    int clock_w = 95;
-    int clock_x = power_x - clock_w - 10;
-
-    int h = 12, m = 0, s = 0;
-    get_rtc_time(&h, &m, &s);
-
-    char time_str[16];
-    time_str[0] = '0' + (h / 10);
-    time_str[1] = '0' + (h % 10);
-    time_str[2] = ':';
-    time_str[3] = '0' + (m / 10);
-    time_str[4] = '0' + (m % 10);
-    time_str[5] = ':';
-    time_str[6] = '0' + (s / 10);
-    time_str[7] = '0' + (s % 10);
-    time_str[8] = '\0';
-
-    draw_rounded_rect_aa(clock_x, (int)taskbar_y + 6, clock_w, 32, 6, 0x001E2233);
-    wm_draw_string_content(time_str, clock_x + 12, (int)taskbar_y + 14, 1, 0x007AA2F7, 0x001E2233, 0, 0, (int)gop_width, (int)gop_height);
-
-    draw_rounded_rect_gradient(power_x, (int)taskbar_y + 6, power_w, 32, 6, 0x00F7768E, 0x00C53B53);
-    wm_draw_string_content("Power", power_x + 18, (int)taskbar_y + 14, 1, 0x00FFFFFF, 0x00C53B53, 0, 0, (int)gop_width, (int)gop_height);
-
-    /* 6. Interaktives Startmenü Popup */
-    if (desktop_menu_open) {
-        int menu_w = 240;
-        int menu_h = 230;
-        int menu_x = 10;
-        int menu_y = (int)(taskbar_y - menu_h - 6);
-
-        draw_rounded_rect_aa(menu_x + 6, menu_y + 6, menu_w, menu_h, 10, 0x00060810);
-        draw_rounded_rect_aa(menu_x, menu_y, menu_w, menu_h, 10, 0x00181A24);
-
-        draw_rounded_rect_gradient(menu_x, menu_y, menu_w, 36, 10, 0x001B62D6, 0x000E429C);
-        draw_filled_rect(menu_x, menu_y + 26, menu_w, 10, 0x000E429C);
-        wm_draw_string_content("VeloOS Startmenue", menu_x + 16, menu_y + 10, 1, 0x00FFFFFF, 0x000E429C, menu_x, menu_y, menu_w, 36);
-
-        int item_y = menu_y + 44;
-        for (int i = 0; i < START_MENU_ITEMS; i++) {
-            if (i == start_menu_selected) {
-                draw_rounded_rect_aa(menu_x + 8, item_y - 4, menu_w - 16, 32, 6, 0x001B62D6);
-                wm_draw_string_content(start_menu_labels[i], menu_x + 16, item_y + 4, 1, 0x00FFFFFF, 0x001B62D6, menu_x, menu_y, menu_w, menu_h);
-            } else {
-                wm_draw_string_content(start_menu_labels[i], menu_x + 16, item_y + 4, 1, 0x00C0CAF5, 0x00181A24, menu_x, menu_y, menu_w, menu_h);
+    if (g_wall_loaded && g_backbuffer != NULL && g_wall_buffer != NULL && gop_width > 0 && gop_height > 0) {
+        if (g_wall_src_w == gop_width && g_wall_src_h == gop_height) {
+            UINTN total = gop_width * gop_height;
+            for (UINTN i = 0; i < total; i++) {
+                g_backbuffer[i] = g_wall_buffer[i];
             }
-            item_y += 34;
+            return;
+        } else {
+            for (UINTN y = 0; y < gop_height; y++) {
+                UINTN src_y = (y * g_wall_src_h) / gop_height;
+                UINT32 *dst_row = &g_backbuffer[y * gop_width];
+                const UINT32 *src_row = &g_wall_buffer[src_y * g_wall_src_w];
+
+                for (UINTN x = 0; x < gop_width; x++) {
+                    UINTN src_x = (x * g_wall_src_w) / gop_width;
+                    dst_row[x] = src_row[src_x];
+                }
+            }
+            return;
         }
     }
 
-    /* Step F: Double-Buffer Blit */
-    swap_buffers();
+    draw_filled_rect(0, 0, gop_width, gop_height, 0x000E1017);
 }
 
 static void execute_start_menu_item(int item) {
     desktop_menu_open = 0;
-    switch (item) {
-        case 0: /* Control Center - Automatisch vermessen */
-            wm_create_window_for_lines(
-                "Control Center",
-                dashboard_text_lines,
-                10,
-                1,
-                paint_dashboard
-            );
-            break;
-        case 1: /* Taschenrechner */
-            wm_create_window_auto(
-                "Taschenrechner",
-                420,
-                140,
-                paint_calculator
-            );
-            break;
-        case 2: /* Matrix Terminal */
-            wm_create_window_auto(
-                "Matrix Terminal",
-                440,
-                110,
-                paint_matrix
-            );
-            break;
-        case 3: /* Storage Manager */
-            wm_create_window_auto(
-                "Storage Manager",
-                460,
-                150,
-                paint_storage
-            );
-            break;
-        case 4: /* Logout */
-            system_mode = 0;
-            logged_in = 0;
-            clear_screen_graphics(0x00000000);
-            draw_string("VeloOS Kernel - Bare Metal Mode Active", 50, 30, 0x00FFFFFF, 0x00000000);
-            draw_string("Abgemeldet. Zurueck in der Shell.", 50, 60, 0x007AA2F7, 0x00000000);
-            gfx_cursor_x = 50; gfx_cursor_y = 120;
-            draw_string("> ", gfx_cursor_x, gfx_cursor_y, 0x00FFFFFF, 0x00000000);
-            gfx_cursor_x += 32;
-            swap_buffers();
-            return;
+    wm_mark_all_dirty();
+
+    int total_app_entries = (disk_app_count > 0 ? disk_app_count : 1);
+
+    if (item < disk_app_count) {
+        if (str_equal_nocase(disk_apps[item], "CALC.BIN")) {
+            calc_app_launch();
+        }
+    } else if (item == total_app_entries) {
+        system_reboot();
+    } else if (item == total_app_entries + 1) {
+        system_shutdown();
     }
-    show_desktop();
+}
+
+static void handle_mouse_events(void) {
+    MouseState *m = mouse_get_state();
+    int mx = m->x;
+    int my = m->y;
+    int taskbar_y = (int)gop_height - 42;
+
+    if (!m->left_button && wm_is_dragging()) {
+        wm_stop_drag();
+    }
+
+    if (wm_is_dragging()) {
+        wm_update_drag(mx, my);
+        return;
+    }
+
+    if (!m->left_clicked) return;
+
+    /* Start Button */
+    if (mx >= 8 && mx <= 103 && my >= taskbar_y + 5 && my <= taskbar_y + 37) {
+        desktop_menu_open = !desktop_menu_open;
+        if (desktop_menu_open) scan_disk_applications();
+        start_menu_selected = 0;
+        wm_mark_all_dirty();
+        return;
+    }
+
+    /* Power Button */
+    int power_w = 85;
+    int power_x = (int)gop_width - power_w - 10;
+    if (mx >= power_x && mx <= power_x + power_w && my >= taskbar_y + 5 && my <= taskbar_y + 37) {
+        system_shutdown();
+        return;
+    }
+
+    /* Window Tabs */
+    int tab_x = 112;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        Window *win = wm_get_window(i);
+        if (!win || win->is_closed) continue;
+        if (mx >= tab_x && mx <= tab_x + 160 && my >= taskbar_y + 5 && my <= taskbar_y + 37) {
+            wm_focus_window(i);
+            wm_mark_all_dirty();
+            return;
+        }
+        tab_x += 168;
+    }
+
+    /* Startmenü */
+    if (desktop_menu_open) {
+        int total_entries = (disk_app_count > 0 ? disk_app_count : 1) + 2;
+        int menu_w = 260;
+        int menu_h = 38 + (total_entries * 28) + 8;
+        int menu_x = 8;
+        int menu_y = taskbar_y - menu_h - 6;
+
+        if (mx >= menu_x && mx <= menu_x + menu_w && my >= menu_y && my <= menu_y + menu_h) {
+            int item_y = menu_y + 38;
+            for (int i = 0; i < total_entries; i++) {
+                if (my >= item_y - 2 && my <= item_y + 24) {
+                    execute_start_menu_item(i);
+                    return;
+                }
+                item_y += 28;
+                if (i == (disk_app_count > 0 ? disk_app_count : 1) - 1) {
+                    item_y += 6;
+                }
+            }
+        } else {
+            desktop_menu_open = 0;
+            wm_mark_all_dirty();
+        }
+    }
+
+    /* Fenster Header & Drag & Drop */
+    for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
+        Window *win = wm_get_window(i);
+        if (!win || win->is_closed || win->is_minimized) continue;
+
+        if (mx >= win->x && mx <= win->x + win->width &&
+            my >= win->y && my <= win->y + win->height) {
+            
+            wm_focus_window(i);
+
+            if (mx >= win->x + win->width - 28 && mx <= win->x + win->width - 6 &&
+                my >= win->y + 6 && my <= win->y + 28) {
+                wm_close_window(i);
+            }
+            else if (mx >= win->x + win->width - 54 && mx <= win->x + win->width - 32 &&
+                     my >= win->y + 6 && my <= win->y + 28) {
+                wm_minimize_window(i);
+            }
+            else if (my >= win->y && my <= win->y + 34) {
+                wm_start_drag(i, mx, my);
+            }
+            else if (mx >= win->x + 12 && mx <= win->x + win->width - 12 &&
+                     my >= win->y + 40 && my <= win->y + win->height - 12) {
+                if (win->on_click) {
+                    win->on_click(win->id, mx - (win->x + 12), my - (win->y + 40));
+                }
+            }
+
+            wm_mark_all_dirty();
+            return;
+        }
+    }
+}
+
+void desktop_tick_frame(void) {
+    net_poll();
+    NetworkState *net = net_get_state();
+
+    if (net->http_synced != last_synced_state) {
+        last_synced_state = net->http_synced;
+        wm_mark_all_dirty();
+    }
+
+    int mouse_moved = mouse_update();
+    MouseState *m = mouse_get_state();
+
+    if (mouse_moved || m->left_clicked || wm_is_dragging()) {
+        handle_mouse_events();
+        wm_mark_dirty(last_mouse_x - 2, last_mouse_y - 2, 20, 26);
+        wm_mark_dirty(m->x - 2, m->y - 2, 20, 26);
+        last_mouse_x = m->x;
+        last_mouse_y = m->y;
+    }
+
+    // Volles Datum & Uhrzeit auslesen
+    int year = 2025, month = 5, day = 1, raw_h = 12, m_t = 0, s = 0;
+    get_rtc_full_datetime(&year, &month, &day, &raw_h, &m_t, &s);
+
+    // Automatische Sommerzeit-Berechnung (MESZ / CEST = UTC+2 vs. MEZ / CET = UTC+1)
+    int offset = net->tz_offset_hours;
+    const char *tz_label = net->timezone_abbr;
+
+    // Für Deutschland/Zentraleuropa dynamisch zwischen CET (+1) und CEST (+2) umschalten
+    if (str_equal_nocase(net->country_code, "DE") || str_equal_nocase(net->country_code, "AT") || 
+        str_equal_nocase(net->country_code, "CH") || str_equal_nocase(net->country_code, "LOC")) {
+        if (is_european_summer_time(year, month, day, raw_h)) {
+            offset = 2; // Sommerzeit MESZ (UTC+2)
+            tz_label = "CEST";
+        } else {
+            offset = 1; // Winterzeit MEZ (UTC+1)
+            tz_label = "CET";
+        }
+    }
+
+    // Exakte Ortszeit berechnen
+    int h = (raw_h + offset + 24) % 24;
+
+    if (s != last_second) {
+        last_second = s;
+        wm_mark_dirty((int)gop_width - 270, (int)gop_height - 44, 270, 44);
+    }
+
+    if (!wm_is_dirty()) {
+        return;
+    }
+
+    /* 1. Wallpaper */
+    draw_desktop_background();
+
+    /* 2. Top-Statusleiste (Live Standort & Zeitzone) */
+    draw_filled_rect(0, 0, gop_width, 30, 0x000F172A);
+    draw_filled_rect(0, 29, gop_width, 1, 0x001E293B);
+
+    wm_draw_text("VeloOS 64-Bit Bare-Metal", 14, 7, 0x0038BDF8, 0x00000000);
+
+    // Standortanzeige mit Live-Zeitzone
+    char loc_info[80];
+    char *lp = loc_info;
+    *lp++ = '['; *lp++ = 'O'; *lp++ = 'r'; *lp++ = 't'; *lp++ = ':'; *lp++ = ' ';
+    for (int i = 0; net->city[i]; i++) *lp++ = net->city[i];
+    *lp++ = ','; *lp++ = ' ';
+    for (int i = 0; net->country_code[i]; i++) *lp++ = net->country_code[i];
+    *lp++ = ' '; *lp++ = '|'; *lp++ = ' ';
+    for (int i = 0; tz_label[i]; i++) *lp++ = tz_label[i];
+    *lp++ = ' '; *lp++ = '('; *lp++ = 'U'; *lp++ = 'T'; *lp++ = 'C';
+    *lp++ = (offset >= 0) ? '+' : '-';
+    int abs_off = offset >= 0 ? offset : -offset;
+    *lp++ = '0' + (char)abs_off;
+    *lp++ = ')'; *lp++ = ']'; *lp = '\0';
+    
+    wm_draw_text(loc_info, 240, 7, net->http_synced ? 0x004ADE80 : 0x00FACC15, 0x00000000);
+
+    wm_draw_text("[F1] Startmenue  |  [TAB] Fenster  |  [ESC] Abmelden", (int)gop_width - 440, 7, 0x00F1F5F9, 0x00000000);
+
+    /* 3. Fenster */
+    wm_render_all();
+
+    /* 4. Taskleiste */
+    int taskbar_h = 42;
+    int taskbar_y = (int)gop_height - taskbar_h;
+
+    draw_filled_rect(0, taskbar_y, gop_width, taskbar_h, 0x000F172A);
+    draw_filled_rect(0, taskbar_y, gop_width, 1, 0x00334155);
+
+    /* Start Button */
+    UINT32 sb_top = desktop_menu_open ? 0x002563EB : 0x001D4ED8;
+    UINT32 sb_bot = desktop_menu_open ? 0x001D4ED8 : 0x001E40AF;
+    draw_rounded_rect_gradient(8, taskbar_y + 5, 95, 32, 6, sb_top, sb_bot);
+    draw_rounded_rect_aa(8, taskbar_y + 5, 95, 32, 6, 0x0060A5FA);
+    draw_rounded_rect_gradient(10, taskbar_y + 7, 91, 28, 4, sb_top, sb_bot);
+    wm_draw_text("[ Start ]", 20, taskbar_y + 13, 0x00FFFFFF, 0x00000000);
+
+    /* Tabs */
+    int tab_x = 112;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        Window *win = wm_get_window(i);
+        if (!win || win->is_closed) continue;
+
+        UINT32 tb_bg = win->is_active ? 0x001E293B : 0x00111827;
+        UINT32 tb_border = win->is_active ? 0x0038BDF8 : 0x00374151;
+        UINT32 tb_text = win->is_active ? 0x00FFFFFF : 0x0094A3B8;
+
+        draw_rounded_rect_aa(tab_x, taskbar_y + 5, 160, 32, 6, tb_border);
+        draw_rounded_rect_aa(tab_x + 1, taskbar_y + 6, 158, 30, 5, tb_bg);
+        wm_draw_text(win->title, tab_x + 12, taskbar_y + 13, tb_text, 0x00000000);
+        tab_x += 168;
+    }
+
+    /* Power Button & Uhrzeit (mit Sommer-/Winterzeit-Tag) */
+    int power_w = 85;
+    int power_x = (int)gop_width - power_w - 10;
+    int clock_w = 135;
+    int clock_x = power_x - clock_w - 10;
+
+    char time_str[24] = {
+        '0' + (char)(h / 10), '0' + (char)(h % 10), ':',
+        '0' + (char)(m_t / 10), '0' + (char)(m_t % 10), ':',
+        '0' + (char)(s / 10), '0' + (char)(s % 10), ' ',
+        tz_label[0], tz_label[1], tz_label[2], tz_label[3], '\0'
+    };
+
+    draw_rounded_rect_aa(clock_x, taskbar_y + 5, clock_w, 32, 6, 0x00334155);
+    draw_rounded_rect_aa(clock_x + 1, taskbar_y + 6, clock_w - 2, 30, 5, 0x001E293B);
+    wm_draw_text(time_str, clock_x + 14, taskbar_y + 13, 0x0038BDF8, 0x00000000);
+
+    draw_rounded_rect_gradient(power_x, taskbar_y + 5, power_w, 32, 6, 0x00DC2626, 0x00991B1B);
+    draw_rounded_rect_aa(power_x, taskbar_y + 5, power_w, 32, 6, 0x00F87171);
+    draw_rounded_rect_gradient(power_x + 1, taskbar_y + 6, power_w - 2, 30, 5, 0x00DC2626, 0x00991B1B);
+    wm_draw_text("Power", power_x + 22, taskbar_y + 13, 0x00FFFFFF, 0x00000000);
+
+    /* 5. Startmenü */
+    if (desktop_menu_open) {
+        int total_entries = (disk_app_count > 0 ? disk_app_count : 1) + 2;
+        int menu_w = 260;
+        int menu_h = 38 + (total_entries * 28) + 8;
+        int menu_x = 8;
+        int menu_y = taskbar_y - menu_h - 6;
+
+        draw_rounded_rect_aa(menu_x + 4, menu_y + 4, menu_w, menu_h, 8, 0x00020617);
+        draw_rounded_rect_aa(menu_x, menu_y, menu_w, menu_h, 8, 0x00334155);
+        draw_rounded_rect_aa(menu_x + 1, menu_y + 1, menu_w - 2, menu_h - 2, 7, 0x000F172A);
+
+        draw_rounded_rect_gradient(menu_x + 2, menu_y + 2, menu_w - 4, 30, 6, 0x002563EB, 0x001D4ED8);
+        wm_draw_text("Programme (FAT32)", menu_x + 14, menu_y + 9, 0x00FFFFFF, 0x00000000);
+
+        int item_y = menu_y + 38;
+        int cur_idx = 0;
+
+        if (disk_app_count == 0) {
+            wm_draw_text("[Keine Apps auf Disk]", menu_x + 14, item_y + 4, 0x0064748B, 0x000F172A);
+            item_y += 28;
+            cur_idx++;
+        } else {
+            for (int i = 0; i < disk_app_count; i++) {
+                if (cur_idx == start_menu_selected) {
+                    draw_rounded_rect_aa(menu_x + 6, item_y - 2, menu_w - 12, 24, 4, 0x002563EB);
+                    wm_draw_text(disk_apps[i], menu_x + 14, item_y + 2, 0x00FFFFFF, 0x002563EB);
+                } else {
+                    wm_draw_text(disk_apps[i], menu_x + 14, item_y + 2, 0x00E2E8F0, 0x000F172A);
+                }
+                item_y += 28;
+                cur_idx++;
+            }
+        }
+
+        draw_filled_rect(menu_x + 10, item_y, menu_w - 20, 1, 0x00334155);
+        item_y += 6;
+
+        const char *sys_items[2] = {"Neustart", "Herunterfahren"};
+        for (int s_idx = 0; s_idx < 2; s_idx++) {
+            if (cur_idx == start_menu_selected) {
+                draw_rounded_rect_aa(menu_x + 6, item_y - 2, menu_w - 12, 24, 4, 0x00DC2626);
+                wm_draw_text(sys_items[s_idx], menu_x + 14, item_y + 2, 0x00FFFFFF, 0x00DC2626);
+            } else {
+                wm_draw_text(sys_items[s_idx], menu_x + 14, item_y + 2, 0x00F87171, 0x000F172A);
+            }
+            item_y += 28;
+            cur_idx++;
+        }
+    }
+
+    /* 6. Mauszeiger */
+    mouse_draw_cursor();
+
+    /* 7. Blit */
+    int dx, dy, dw, dh;
+    wm_get_dirty_bounds(&dx, &dy, &dw, &dh);
+    swap_buffers_rect(dx, dy, dw, dh);
+    wm_clear_dirty();
 }
 
 void desktop_start(void) {
@@ -316,42 +534,45 @@ void desktop_start(void) {
     start_menu_selected = 0;
     system_mode = 3;
 
+    net_init();
+    mouse_init();
+    scan_disk_applications();
+    load_wallpaper_from_disk();
     wm_init();
-    wm_create_window_for_lines(
-        "Control Center",
-        dashboard_text_lines,
-        10,
-        1,
-        paint_dashboard
-    );
-
-    show_desktop();
+    wm_mark_all_dirty();
+    desktop_tick_frame();
 }
 
 void desktop_handle_key(char c) {
+    int total_entries = (disk_app_count > 0 ? disk_app_count : 1) + 2;
+
     if (desktop_menu_open) {
         if (c == 0x1B) {
             desktop_menu_open = 0;
-            show_desktop();
+            wm_mark_all_dirty();
             return;
         }
         if (c == 'w' || c == 'W') {
-            start_menu_selected = (start_menu_selected - 1 + START_MENU_ITEMS) % START_MENU_ITEMS;
-            show_desktop();
+            start_menu_selected = (start_menu_selected - 1 + total_entries) % total_entries;
+            wm_mark_all_dirty();
             return;
         }
         if (c == 's' || c == 'S') {
-            start_menu_selected = (start_menu_selected + 1) % START_MENU_ITEMS;
-            show_desktop();
+            start_menu_selected = (start_menu_selected + 1) % total_entries;
+            wm_mark_all_dirty();
             return;
         }
         if (c == '\n' || c == '\r') {
             execute_start_menu_item(start_menu_selected);
             return;
         }
-        if (c >= '1' && c <= '5') {
-            execute_start_menu_item(c - '1');
-            return;
+    }
+
+    int active_id = wm_get_active_window_id();
+    if (active_id >= 0) {
+        Window *win = wm_get_window(active_id);
+        if (win && win->on_key) {
+            win->on_key(win->id, c);
         }
     }
 
@@ -359,10 +580,9 @@ void desktop_handle_key(char c) {
         desktop_menu_open = 0;
         system_mode = 0;
         logged_in = 0;
-
         clear_screen_graphics(0x00000000);
-        draw_string("VeloOS Kernel - Bare Metal Mode Active", 50, 30, 0x00FFFFFF, 0x00000000);
-        draw_string("Abgemeldet. Zurueck in der Shell.", 50, 60, 0x007AA2F7, 0x00000000);
+        wm_draw_text("VeloOS Kernel - Bare Metal Active", 50, 30, 0x00FFFFFF, 0x00000000);
+        wm_draw_text("Abgemeldet. Zurueck in der Shell.", 50, 60, 0x0038BDF8, 0x00000000);
         gfx_cursor_x = 50; gfx_cursor_y = 120;
         draw_string("> ", gfx_cursor_x, gfx_cursor_y, 0x00FFFFFF, 0x00000000);
         gfx_cursor_x += 32;
@@ -372,28 +592,15 @@ void desktop_handle_key(char c) {
 
     if ((unsigned char)c == 0x3B || (unsigned char)c == 0xF1) {
         desktop_menu_open = !desktop_menu_open;
+        if (desktop_menu_open) {
+            scan_disk_applications();
+        }
         start_menu_selected = 0;
-        show_desktop();
+        wm_mark_all_dirty();
         return;
     }
 
-    if (c == 0x09) {
-        wm_focus_next();
-        show_desktop();
-        return;
-    }
-
-    if (c == 'm' || c == 'M') {
-        wm_minimize_active();
-        show_desktop();
-        return;
-    }
-
-    if (c == 'x' || c == 'X') {
-        wm_close_active();
-        show_desktop();
-        return;
-    }
-
-    show_desktop();
+    if (c == 0x09) { wm_focus_next(); return; }
+    if (c == 'm' || c == 'M') { wm_minimize_active(); return; }
+    if (c == 'x' || c == 'X') { wm_close_active(); return; }
 }

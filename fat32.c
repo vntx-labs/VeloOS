@@ -1,7 +1,7 @@
 #include "fat32.h"
 
 /*
- * Sicherer FAT32-Treiber mit integrierter Formatier-Funktion
+ * Sicherer FAT32-Treiber mit integrierter Formatier- & Verzeichnis-Lese-Funktion
  */
 
 static FAT32_BPB bpb;
@@ -112,10 +112,10 @@ int fat32_init(void *ahci_port) {
 int fat32_format(void *ahci_port, UINT64 disk_sectors) {
     if (!ahci_port) return 0;
     
-    if (disk_sectors == 0) disk_sectors = 131072; /* Fallback: 64MB */
+    if (disk_sectors == 0) disk_sectors = 131072;
 
     UINT32 total_sec = (disk_sectors > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (UINT32)disk_sectors;
-    UINT8 spc = 8; /* 4KB Cluster */
+    UINT8 spc = 8;
     UINT16 reserved = 32;
     UINT8 num_fats = 2;
 
@@ -124,28 +124,27 @@ int fat32_format(void *ahci_port, UINT64 disk_sectors) {
     UINT8 sector[512];
     __builtin_memset(sector, 0, 512);
 
-    /* 1. BPB erstellen */
     sector[0] = 0xEB; sector[1] = 0x58; sector[2] = 0x90;
     __builtin_memcpy(&sector[3], "MSDOS5.0", 8);
-    sector[11] = 0x00; sector[12] = 0x02; /* 512 Bytes / Sector */
+    sector[11] = 0x00; sector[12] = 0x02;
     sector[13] = spc;
     sector[14] = (UINT8)(reserved & 0xFF);
     sector[15] = (UINT8)((reserved >> 8) & 0xFF);
     sector[16] = num_fats;
     sector[17] = 0; sector[18] = 0;
     sector[19] = 0; sector[20] = 0;
-    sector[21] = 0xF8; /* Fixed Disk */
+    sector[21] = 0xF8;
     sector[22] = 0; sector[23] = 0;
     sector[24] = 0x3F; sector[25] = 0x00;
     sector[26] = 0xFF; sector[27] = 0x00;
-    write_u32_le(&sector[28], 0); /* Hidden */
+    write_u32_le(&sector[28], 0);
     write_u32_le(&sector[32], total_sec);
     write_u32_le(&sector[36], fat_size);
     sector[40] = 0; sector[41] = 0;
     sector[42] = 0; sector[43] = 0;
-    write_u32_le(&sector[44], 2); /* Root Cluster 2 */
-    sector[48] = 1; sector[49] = 0; /* FSInfo sector 1 */
-    sector[50] = 6; sector[51] = 0; /* Backup boot sector 6 */
+    write_u32_le(&sector[44], 2);
+    sector[48] = 1; sector[49] = 0;
+    sector[50] = 6; sector[51] = 0;
     sector[64] = 0x80;
     sector[66] = 0x29;
     write_u32_le(&sector[67], 0x12345678);
@@ -154,9 +153,8 @@ int fat32_format(void *ahci_port, UINT64 disk_sectors) {
     sector[510] = 0x55; sector[511] = 0xAA;
 
     if (!write_sata_sector(ahci_port, 0, 0, 1, sector)) return 0;
-    if (!write_sata_sector(ahci_port, 6, 0, 1, sector)) return 0; /* Backup Boot Sector */
+    if (!write_sata_sector(ahci_port, 6, 0, 1, sector)) return 0;
 
-    /* 2. FSInfo Sektor */
     __builtin_memset(sector, 0, 512);
     write_u32_le(&sector[0], 0x41615252);
     write_u32_le(&sector[484], 0x61417272);
@@ -165,24 +163,20 @@ int fat32_format(void *ahci_port, UINT64 disk_sectors) {
     sector[510] = 0x55; sector[511] = 0xAA;
     if (!write_sata_sector(ahci_port, 1, 0, 1, sector)) return 0;
 
-    /* 3. FAT1 und FAT2 initialisieren */
     __builtin_memset(sector, 0, 512);
-    write_u32_le(&sector[0], 0x0FFFFFF8); /* Media descriptor */
-    write_u32_le(&sector[4], 0x0FFFFFFF); /* EOC */
-    write_u32_le(&sector[8], 0x0FFFFFFF); /* Root dir cluster EOC */
+    write_u32_le(&sector[0], 0x0FFFFFF8);
+    write_u32_le(&sector[4], 0x0FFFFFFF);
+    write_u32_le(&sector[8], 0x0FFFFFFF);
 
-    /* Erster Sektor der FAT1 & FAT2 */
     if (!write_sata_sector(ahci_port, reserved, 0, 1, sector)) return 0;
     if (!write_sata_sector(ahci_port, reserved + fat_size, 0, 1, sector)) return 0;
 
-    /* Restliche FAT Sektoren nullen */
     __builtin_memset(sector, 0, 512);
     for (UINT32 s = 1; s < fat_size; s++) {
         if (!write_sata_sector(ahci_port, reserved + s, 0, 1, sector)) return 0;
         if (!write_sata_sector(ahci_port, reserved + fat_size + s, 0, 1, sector)) return 0;
     }
 
-    /* 4. Root-Verzeichnis (Cluster 2) leeren */
     UINT32 root_lba = reserved + (num_fats * fat_size);
     for (UINT32 s = 0; s < spc; s++) {
         if (!write_sata_sector(ahci_port, root_lba + s, 0, 1, sector)) return 0;
@@ -518,6 +512,9 @@ static int write_file_clusters(UINT32 first_cluster,
     return bytes_written == size;
 }
 
+/*
+ * Optimierter FAT32 Datei-Leser mit Direct-DMA Cluster-Übertragung
+ */
 int fat32_read_file(void *ahci_port,
                     const char *filename,
                     void *buffer,
@@ -547,10 +544,11 @@ int fat32_read_file(void *ahci_port,
 
     if (file_cluster < 2) return -1;
 
-    UINT8 sector_buf[512];
     UINT8 *dest = (UINT8 *)buffer;
     UINT32 bytes_read = 0;
     UINT32 guard = 0;
+    UINT32 cluster_bytes = (UINT32)bpb.sectors_per_cluster * 512U;
+    UINT8 sector_buf[512];
 
     while (bytes_read < bytes_to_read && valid_cluster(file_cluster)) {
         if (++guard > total_clusters) return -1;
@@ -558,27 +556,38 @@ int fat32_read_file(void *ahci_port,
         UINT32 lba = cluster_to_lba(file_cluster);
         if (lba == 0) return -1;
 
-        for (UINT32 s = 0; s < bpb.sectors_per_cluster; s++) {
-            if (!read_sata_sector(ahci_port, lba + s, 0, 1, sector_buf)) {
+        UINT32 remaining = bytes_to_read - bytes_read;
+
+        if (remaining >= cluster_bytes) {
+            /* Ganzen Cluster in einem einzigen AHCI-DMA-Transfer einlesen (Turbo-Speed) */
+            if (!read_sata_sector(ahci_port, lba, 0, bpb.sectors_per_cluster, dest + bytes_read)) {
                 return -1;
             }
+            bytes_read += cluster_bytes;
+        } else {
+            /* Letzten Cluster sektorweise einlesen */
+            for (UINT32 s = 0; s < bpb.sectors_per_cluster; s++) {
+                if (!read_sata_sector(ahci_port, lba + s, 0, 1, sector_buf)) {
+                    return -1;
+                }
 
-            UINT32 remaining = bytes_to_read - bytes_read;
-            UINT32 chunk = remaining > 512U ? 512U : remaining;
-            __builtin_memcpy(dest + bytes_read, sector_buf, chunk);
-            bytes_read += chunk;
+                UINT32 rem_sec = bytes_to_read - bytes_read;
+                UINT32 chunk = rem_sec > 512U ? 512U : rem_sec;
+                __builtin_memcpy(dest + bytes_read, sector_buf, chunk);
+                bytes_read += chunk;
 
-            if (bytes_read >= bytes_to_read) break;
+                if (bytes_read >= bytes_to_read) break;
+            }
         }
 
         if (bytes_read >= bytes_to_read) break;
 
         UINT32 next = get_next_cluster(file_cluster);
-        if (is_eoc(next) || !valid_cluster(next)) return -1;
+        if (is_eoc(next) || !valid_cluster(next)) break;
         file_cluster = next;
     }
 
-    return (int)file_size;
+    return (int)bytes_read;
 }
 
 int fat32_write_file(void *ahci_port,
@@ -667,4 +676,60 @@ int fat32_write_file(void *ahci_port,
     }
 
     return 1;
+}
+
+static void fat_name_to_string(const UINT8 *fat_name, char *out) {
+    int pos = 0;
+    for (int i = 0; i < 8; i++) {
+        if (fat_name[i] != ' ') {
+            out[pos++] = fat_name[i];
+        }
+    }
+    if (fat_name[8] != ' ') {
+        out[pos++] = '.';
+        for (int i = 8; i < 11; i++) {
+            if (fat_name[i] != ' ') {
+                out[pos++] = fat_name[i];
+            }
+        }
+    }
+    out[pos] = '\0';
+}
+
+int fat32_list_root(void *ahci_port, char out_files[][32], int max_files) {
+    if (!ahci_port || !out_files || max_files <= 0) return 0;
+    if (g_port != ahci_port || !g_initialized) {
+        if (!fat32_init(ahci_port)) return 0;
+    }
+
+    UINT8 sector_buf[512];
+    UINT32 current_cluster = bpb.root_cluster;
+    int found_count = 0;
+    UINT32 guard = 0;
+
+    while (valid_cluster(current_cluster) && !is_eoc(current_cluster) && found_count < max_files) {
+        if (++guard > total_clusters) break;
+
+        UINT32 lba = cluster_to_lba(current_cluster);
+        if (lba == 0) break;
+
+        for (UINT32 s = 0; s < bpb.sectors_per_cluster && found_count < max_files; s++) {
+            if (!read_sata_sector(g_port, lba + s, 0, 1, sector_buf)) return found_count;
+
+            FAT32_DIR_ENTRY *dir = (FAT32_DIR_ENTRY *)sector_buf;
+            for (UINT32 e = 0; e < 16 && found_count < max_files; e++) {
+                if (dir[e].name[0] == 0x00) return found_count;
+                if (!is_regular_short_entry(&dir[e])) continue;
+
+                fat_name_to_string(dir[e].name, out_files[found_count]);
+                found_count++;
+            }
+        }
+
+        UINT32 next = get_next_cluster(current_cluster);
+        if (is_eoc(next) || !valid_cluster(next)) break;
+        current_cluster = next;
+    }
+
+    return found_count;
 }

@@ -5,6 +5,7 @@
 #include <efilib.h>
 
 void desktop_start(void);
+void desktop_tick_frame(void);
 void desktop_handle_key(char c);
 
 #endif

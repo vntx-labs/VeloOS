@@ -27,7 +27,10 @@ OBJS = kernel.o \
        ahci.o \
        fat32.o \
        wm.o \
-       desktop.o
+       desktop.o \
+       mouse.o \
+       calc.o \
+       net.o
 
 # ------------------------------------------------------------
 # EFI linker flags
@@ -44,13 +47,20 @@ LDFLAGS = -nostdlib \
           -lefi \
           -lgnuefi
 
-.PHONY: all clean rebuild run
+.PHONY: all clean rebuild run clean-all
 
 # ------------------------------------------------------------
 # Default target
 # ------------------------------------------------------------
 
-all: os.img
+all: os.img data.img
+
+# ------------------------------------------------------------
+# Wallpaper Generation
+# ------------------------------------------------------------
+
+WALL.BIN: gen_wallpaper.py
+	python3 gen_wallpaper.py
 
 # ------------------------------------------------------------
 # Kernel & Modules
@@ -65,6 +75,12 @@ font.o: font.c font.h
 keyboard.o: keyboard.c keyboard.h
 	$(CC) $(CFLAGS) -c keyboard.c -o keyboard.o
 
+mouse.o: mouse.c mouse.h
+	$(CC) $(CFLAGS) -c mouse.c -o mouse.o
+
+net.o: net.c net.h
+	$(CC) $(CFLAGS) -c net.c -o net.o
+
 ahci.o: ahci.c ahci.h
 	$(CC) $(CFLAGS) -c ahci.c -o ahci.o
 
@@ -74,16 +90,18 @@ fat32.o: fat32.c fat32.h ahci.h
 wm.o: wm.c wm.h font.h
 	$(CC) $(CFLAGS) -c wm.c -o wm.o
 
-desktop.o: desktop.c desktop.h font.h wm.h
+calc.o: calc.c calc.h wm.h font.h
+	$(CC) $(CFLAGS) -c calc.c -o calc.o
+
+desktop.o: desktop.c desktop.h font.h wm.h ahci.h fat32.h mouse.h calc.h net.h
 	$(CC) $(CFLAGS) -c desktop.c -o desktop.o
 
 # ------------------------------------------------------------
-# EFI Kernel
+# EFI Kernel Binary
 # ------------------------------------------------------------
 
 kernel.efi: $(OBJS)
 	$(LD) $(LDFLAGS) -o kernel.so
-
 	$(OBJCOPY) \
 		-j .text \
 		-j .sdata \
@@ -101,24 +119,31 @@ kernel.efi: $(OBJS)
 # Disk Images
 # ------------------------------------------------------------
 
-os.img: kernel.efi
+os.img: kernel.efi WALL.BIN
 	rm -f os.img
 	dd if=/dev/zero of=os.img bs=1M count=64
 	mkfs.vfat -F 32 os.img
 	mmd -i os.img ::/EFI
 	mmd -i os.img ::/EFI/BOOT
 	mcopy -i os.img kernel.efi ::/EFI/BOOT/BOOTX64.EFI
+	mcopy -i os.img WALL.BIN ::/WALL.BIN
 
-# Erstellt data.img NUR, wenn die Datei physisch nicht existiert
 data.img:
-	dd if=/dev/zero of=data.img bs=1M count=1024
+	@if [ ! -f data.img ]; then \
+		dd if=/dev/zero of=data.img bs=1M count=1024; \
+		mkfs.vfat -F 32 data.img; \
+		touch CALC.BIN; \
+	fi
+	@touch CALC.BIN
+	mcopy -o -i data.img CALC.BIN ::/CALC.BIN
 
 # ------------------------------------------------------------
-# Run mit zwei Laufwerken
+# Run mit Netzwerk & 512MB RAM
 # ------------------------------------------------------------
 
 run: os.img data.img
 	qemu-system-x86_64 \
+		-m 512M \
 		-drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
 		-machine q35 \
 		-drive file=os.img,format=raw,if=none,id=bootdisk \
@@ -127,16 +152,17 @@ run: os.img data.img
 		-device ide-hd,drive=datadisk,bus=ide.1 \
 		-device qemu-xhci,id=xhci \
 		-device usb-tablet,bus=xhci.0 \
+		-netdev user,id=net0 \
+		-device e1000,netdev=net0 \
 		-serial stdio
 
 # ------------------------------------------------------------
-# Clean & Rebuild (data.img wird hier BESCHÜTZT)
+# Clean
 # ------------------------------------------------------------
 
 clean:
-	rm -f *.o *.so *.efi os.img qemu.log
+	rm -f *.o *.so *.efi os.img qemu.log WALL.BIN WALL.PNG CALC.BIN
 
-# Falls du die Festplatte DOCH mal komplett plattmachen willst
 clean-all: clean
 	rm -f data.img
 

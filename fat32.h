@@ -60,5 +60,6 @@ int fat32_init(void *ahci_port);
 int fat32_format(void *ahci_port, UINT64 total_sectors);
 int fat32_read_file(void *ahci_port, const char *filename, void *buffer, UINT32 max_size);
 int fat32_write_file(void *ahci_port, const char *filename, void *buffer, UINT32 size);
+int fat32_list_root(void *ahci_port, char out_files[][32], int max_files);
 
 #endif

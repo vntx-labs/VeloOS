@@ -1,4 +1,4 @@
-// kernel.c - UEFI OS Kernel mit Double Buffering & Pitch-Scanline Blitting
+// kernel.c - UEFI OS Kernel mit dynamischer On-the-Fly Auflösungserkennung
 #include <efi.h>
 #include <efilib.h>
 #include "keyboard.h"
@@ -35,8 +35,9 @@ UINTN gop_height = 0;
 VOID* framebuffer_base = NULL;
 UINTN framebuffer_size = 0;
 
-/* 32-Bit Linearer Backbuffer (bis 1920x1080) */
-static UINT32 g_backbuffer[1920 * 1080];
+/* Globale Puffer für Backbuffer und Wallpaper */
+UINT32 *g_backbuffer = NULL;
+UINT32 *g_wall_buffer = NULL;
 
 UINTN gfx_cursor_x = 50;
 UINTN gfx_cursor_y = 190;
@@ -79,11 +80,12 @@ void draw_string(const char* str, UINTN x, UINTN y, UINT32 fg_color, UINT32 bg_c
 void draw_filled_rect(UINTN start_x, UINTN start_y, UINTN width, UINTN height, UINT32 color);
 void draw_window(UINTN x, UINTN y, UINTN w, UINTN h, const char* title);
 void swap_buffers(void);
+void swap_buffers_rect(int rx, int ry, int rw, int rh);
 
-void show_login_screen();
-void show_account_creator_ui();
-void show_drive_select_dialog();
-void show_format_dialog();
+void show_login_screen(void);
+void show_account_creator_ui(void);
+void show_drive_select_dialog(void);
+void show_format_dialog(void);
 
 int strcmp(const char* s1, const char* s2) {
     while (*s1 && (*s1 == *s2)) {
@@ -100,7 +102,7 @@ void encrypt_data(char *data, UINT32 size) {
     }
 }
 
-int check_account_exists() {
+int check_account_exists(void) {
     if (selected_drive < 0 || selected_drive >= num_drives) return 0;
     void *port = drives[selected_drive].port;
     if (!port) return 0;
@@ -200,7 +202,7 @@ static inline unsigned int inl(unsigned short port) {
     return ret;
 }
 
-void system_shutdown() {
+void system_shutdown(void) {
     outw(0x604, 0x2000);
     outw(0xB004, 0x2000);
     if (g_st && g_st->RuntimeServices) {
@@ -209,7 +211,7 @@ void system_shutdown() {
     while(1) { __asm__ volatile("cli; hlt"); }
 }
 
-void system_reboot() {
+void system_reboot(void) {
     if (g_st && g_st->RuntimeServices) {
         g_st->RuntimeServices->ResetSystem(EfiResetWarm, EFI_SUCCESS, 0, NULL);
     }
@@ -226,44 +228,135 @@ int format_disk_fat32(void *port) {
     return fat32_format(port, sec_count);
 }
 
-void init_gop() {
+/*
+ * Initialisiert GOP und reserviert Speicherseiten sicher
+ */
+void init_gop(void) {
     EFI_GUID gop_guid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
     EFI_STATUS status = g_st->BootServices->LocateProtocol(&gop_guid, NULL, (VOID**)&gop);
-    if (status != EFI_SUCCESS || gop == NULL) return;
+    if (status != EFI_SUCCESS || gop == NULL || !gop->Mode || !gop->Mode->Info) return;
+
     gop_width = gop->Mode->Info->HorizontalResolution;
     gop_height = gop->Mode->Info->VerticalResolution;
     framebuffer_base = (VOID*)gop->Mode->FrameBufferBase;
     framebuffer_size = gop->Mode->FrameBufferSize;
+
+    /* Puffergröße auf mind. 1920x1080 (8.3 MB) festlegen */
+    UINTN fb_bytes = gop_width * gop_height * sizeof(UINT32);
+    if (fb_bytes < 1920 * 1080 * sizeof(UINT32)) {
+        fb_bytes = 1920 * 1080 * sizeof(UINT32);
+    }
+    UINTN fb_pages = EFI_SIZE_TO_PAGES(fb_bytes);
+
+    /* 1. Backbuffer Seiten allozieren */
+    EFI_PHYSICAL_ADDRESS fb_phys = 0;
+    status = g_st->BootServices->AllocatePages(AllocateAnyPages, EfiLoaderData, fb_pages, &fb_phys);
+    if (status == EFI_SUCCESS && fb_phys != 0) {
+        g_backbuffer = (UINT32*)(UINTN)fb_phys;
+        for (UINTN i = 0; i < fb_bytes / 4; i++) g_backbuffer[i] = 0;
+    }
+
+    /* 2. Wallpaper Puffer Seiten allozieren (1920x1080 * 4 = 8.3 MB) */
+    UINTN wall_bytes = 1920 * 1080 * sizeof(UINT32) + 4096;
+    UINTN wall_pages = EFI_SIZE_TO_PAGES(wall_bytes);
+
+    EFI_PHYSICAL_ADDRESS wall_phys = 0;
+    status = g_st->BootServices->AllocatePages(AllocateAnyPages, EfiLoaderData, wall_pages, &wall_phys);
+    if (status == EFI_SUCCESS && wall_phys != 0) {
+        g_wall_buffer = (UINT32*)(UINTN)wall_phys;
+        for (UINTN i = 0; i < wall_bytes / 4; i++) g_wall_buffer[i] = 0;
+    }
+}
+
+/*
+ * Erkennt Auflösungs- & Framebuffer-Änderungen "On the Fly"
+ */
+void check_screen_resolution_change(void) {
+    if (!gop || !gop->Mode || !gop->Mode->Info) return;
+
+    UINTN current_w = gop->Mode->Info->HorizontalResolution;
+    UINTN current_h = gop->Mode->Info->VerticalResolution;
+    VOID* current_fb = (VOID*)gop->Mode->FrameBufferBase;
+
+    if (current_w != gop_width || current_h != gop_height || current_fb != framebuffer_base) {
+        gop_width = current_w;
+        gop_height = current_h;
+        framebuffer_base = current_fb;
+        framebuffer_size = gop->Mode->FrameBufferSize;
+
+        wm_mark_all_dirty();
+    }
 }
 
 void put_pixel(UINTN x, UINTN y, UINT32 color) {
-    if (x >= gop_width || y >= gop_height) return;
+    if (!g_backbuffer || x >= gop_width || y >= gop_height) return;
     g_backbuffer[y * gop_width + x] = color;
 }
 
 UINT32 get_pixel(UINTN x, UINTN y) {
-    if (x >= gop_width || y >= gop_height) return 0;
+    if (!g_backbuffer || x >= gop_width || y >= gop_height) return 0;
     return g_backbuffer[y * gop_width + x];
 }
 
 void clear_screen_graphics(UINT32 color) {
+    if (!g_backbuffer) return;
     UINTN total = gop_width * gop_height;
-    if (total > 1920 * 1080) total = 1920 * 1080;
     for (UINTN i = 0; i < total; i++) {
         g_backbuffer[i] = color;
     }
 }
 
-/* 1. Exakter Pitch/Scanline-Blit ohne Bildversatz */
-void swap_buffers(void) {
-    if (!framebuffer_base || !gop) return;
+/* 128-Bit SSE2 Hardware Blitter */
+void swap_buffers_rect(int rx, int ry, int rw, int rh) {
+    if (!framebuffer_base || !gop || !g_backbuffer) return;
+    if (rw <= 0 || rh <= 0) return;
+
+    if (rx < 0) { rw += rx; rx = 0; }
+    if (ry < 0) { rh += ry; ry = 0; }
+    if (rx + rw > (int)gop_width) rw = (int)gop_width - rx;
+    if (ry + rh > (int)gop_height) rh = (int)gop_height - ry;
+    if (rw <= 0 || rh <= 0) return;
+
     UINT32* fb = (UINT32*)framebuffer_base;
-    UINTN scanline = gop->Mode->Info->PixelsPerScanLine;
+    UINTN scanline = (gop->Mode && gop->Mode->Info) ? gop->Mode->Info->PixelsPerScanLine : gop_width;
     if (scanline == 0) scanline = gop_width;
 
-    for (UINTN y = 0; y < gop_height; y++) {
-        __builtin_memcpy(&fb[y * scanline], &g_backbuffer[y * gop_width], gop_width * sizeof(UINT32));
+    UINTN copy_bytes = (UINTN)rw * sizeof(UINT32);
+    UINTN blocks_64 = copy_bytes / 64;
+    UINTN rem_bytes = copy_bytes % 64;
+
+    for (int y = ry; y < ry + rh; y++) {
+        UINT8* dst_ptr = (UINT8*)&fb[y * scanline + rx];
+        const UINT8* src_ptr = (const UINT8*)&g_backbuffer[y * gop_width + rx];
+
+        for (UINTN b = 0; b < blocks_64; b++) {
+            __asm__ volatile(
+                "movdqu 0(%1), %%xmm0\n\t"
+                "movdqu 16(%1), %%xmm1\n\t"
+                "movdqu 32(%1), %%xmm2\n\t"
+                "movdqu 48(%1), %%xmm3\n\t"
+                "movdqu %%xmm0, 0(%0)\n\t"
+                "movdqu %%xmm1, 16(%0)\n\t"
+                "movdqu %%xmm2, 32(%0)\n\t"
+                "movdqu %%xmm3, 48(%0)\n\t"
+                :
+                : "r"(dst_ptr + b * 64), "r"(src_ptr + b * 64)
+                : "xmm0", "xmm1", "xmm2", "xmm3", "memory"
+            );
+        }
+
+        if (rem_bytes > 0) {
+            UINTN offset = blocks_64 * 64;
+            UINT64* d64 = (UINT64*)(dst_ptr + offset);
+            const UINT64* s64 = (const UINT64*)(src_ptr + offset);
+            UINTN qwords = rem_bytes / 8;
+            for (UINTN q = 0; q < qwords; q++) d64[q] = s64[q];
+        }
     }
+}
+
+void swap_buffers(void) {
+    swap_buffers_rect(0, 0, (int)gop_width, (int)gop_height);
 }
 
 void draw_char(char c, UINTN x, UINTN y, UINT32 fg_color, UINT32 bg_color) {
@@ -310,11 +403,14 @@ void draw_window(UINTN x, UINTN y, UINTN w, UINTN h, const char* title) {
     draw_string("X", x + w - 22, y + 8, 0x00FFFFFF, 0x00E06C75);
 }
 
-void show_drive_select_dialog() {
+void show_drive_select_dialog(void) {
     clear_screen_graphics(0x000A0C14);
     
     UINTN win_w = 700;
     UINTN win_h = 400;
+    if (win_w > gop_width - 40) win_w = gop_width - 40;
+    if (win_h > gop_height - 40) win_h = gop_height - 40;
+
     UINTN win_x = (gop_width - win_w) / 2;
     UINTN win_y = (gop_height - win_h) / 2;
     
@@ -357,15 +453,18 @@ void show_drive_select_dialog() {
         y += 50;
     }
     
-    draw_string("[W / S] Auswaehlen | [ENTER] Bestaetigen", win_x + 20, win_y + 350, 0x00777788, 0x00181A24);
+    draw_string("[W / S] Auswaehlen | [ENTER] Bestaetigen", win_x + 20, win_y + win_h - 40, 0x00777788, 0x00181A24);
     swap_buffers();
 }
 
-void show_format_dialog() {
+void show_format_dialog(void) {
     clear_screen_graphics(0x000A0C14);
     
     UINTN win_w = 600;
     UINTN win_h = 400;
+    if (win_w > gop_width - 40) win_w = gop_width - 40;
+    if (win_h > gop_height - 40) win_h = gop_height - 40;
+
     UINTN win_x = (gop_width - win_w) / 2;
     UINTN win_y = (gop_height - win_h) / 2;
     
@@ -402,7 +501,7 @@ void show_format_dialog() {
     draw_rounded_rect_aa((int)(win_x + 20), (int)(win_y + 310), 200, 30, 6, 0x0024283B);
     draw_string(format_confirm, win_x + 30, win_y + 316, 0x0000FF00, 0x0024283B);
     
-    draw_string("[ESC] Abbrechen", win_x + 20, win_y + 360, 0x00777788, 0x00181A24);
+    draw_string("[ESC] Abbrechen", win_x + 20, win_y + win_h - 40, 0x00777788, 0x00181A24);
     swap_buffers();
 }
 
@@ -512,10 +611,13 @@ void handle_format_key(char c) {
     show_format_dialog();
 }
 
-void show_login_screen() {
+void show_login_screen(void) {
     clear_screen_graphics(0x000A0C14);
     UINTN win_w = 480;
     UINTN win_h = 320;
+    if (win_w > gop_width - 40) win_w = gop_width - 40;
+    if (win_h > gop_height - 40) win_h = gop_height - 40;
+
     UINTN win_x = (gop_width - win_w) / 2;
     UINTN win_y = (gop_height - win_h) / 2;
 
@@ -523,20 +625,20 @@ void show_login_screen() {
 
     UINT32 col_u = (login_field_focus == 0) ? 0x0000FFCC : 0x00555566;
     draw_string("Benutzername:", win_x + 20, win_y + 55, 0x00FFFFFF, 0x00181A24);
-    draw_rounded_rect_aa((int)(win_x + 20), (int)(win_y + 80), 440, 35, 6, 0x0024283B);
+    draw_rounded_rect_aa((int)(win_x + 20), (int)(win_y + 80), (int)(win_w - 40), 35, 6, 0x0024283B);
     draw_string(login_username, win_x + 30, win_y + 88, col_u, 0x0024283B);
 
     UINT32 col_p = (login_field_focus == 1) ? 0x0000FFCC : 0x00555566;
     draw_string("Passwort:", win_x + 20, win_y + 135, 0x00FFFFFF, 0x00181A24);
-    draw_rounded_rect_aa((int)(win_x + 20), (int)(win_y + 160), 440, 35, 6, 0x0024283B);
+    draw_rounded_rect_aa((int)(win_x + 20), (int)(win_y + 160), (int)(win_w - 40), 35, 6, 0x0024283B);
     char masked[32]; int p = 0; while(login_password[p]) { masked[p++] = '*'; } masked[p] = '\0';
     draw_string(masked, win_x + 30, win_y + 168, col_p, 0x0024283B);
 
     UINT32 btn_bg = (login_field_focus == 2) ? 0x0000FF00 : 0x001B62D6;
-    draw_rounded_rect_aa((int)(win_x + 140), (int)(win_y + 225), 200, 40, 6, btn_bg);
-    draw_string("Anmelden", win_x + 180, win_y + 236, 0x00000000, btn_bg);
+    draw_rounded_rect_aa((int)(win_x + (win_w - 200) / 2), (int)(win_y + 225), 200, 40, 6, btn_bg);
+    draw_string("Anmelden", win_x + (win_w - 200) / 2 + 40, win_y + 236, 0x00000000, btn_bg);
 
-    draw_string("[TAB] Wechseln | [ENTER] OK | [ESC] Shell", win_x + 30, win_y + 285, 0x00777788, 0x00181A24);
+    draw_string("[TAB] Wechseln | [ENTER] OK | [ESC] Shell", win_x + 20, win_y + win_h - 35, 0x00777788, 0x00181A24);
 
     if (login_error) {
         draw_string("Falscher User oder Pass!", win_x + 25, win_y + 10, 0x00FF0000, 0x000E429C);
@@ -544,10 +646,13 @@ void show_login_screen() {
     swap_buffers();
 }
 
-void show_account_creator_ui() {
+void show_account_creator_ui(void) {
     clear_screen_graphics(0x000A0C14);
     UINTN win_w = 480;
     UINTN win_h = 320;
+    if (win_w > gop_width - 40) win_w = gop_width - 40;
+    if (win_h > gop_height - 40) win_h = gop_height - 40;
+
     UINTN win_x = (gop_width - win_w) / 2;
     UINTN win_y = (gop_height - win_h) / 2;
 
@@ -555,22 +660,22 @@ void show_account_creator_ui() {
     draw_string("Ersten Administrator anlegen:", win_x + 20, win_y + 50, 0x0000FFCC, 0x00181A24);
     
     draw_string("Username:", win_x + 20, win_y + 90, 0x00FFFFFF, 0x00181A24);
-    draw_rounded_rect_aa((int)(win_x + 20), (int)(win_y + 115), 440, 30, 6, 0x0024283B);
+    draw_rounded_rect_aa((int)(win_x + 20), (int)(win_y + 115), (int)(win_w - 40), 30, 6, 0x0024283B);
     draw_string(ui_username, win_x + 30, win_y + 121, 0x00FFFFFF, 0x0024283B);
 
     draw_string("Password:", win_x + 20, win_y + 160, 0x00FFFFFF, 0x00181A24);
-    draw_rounded_rect_aa((int)(win_x + 20), (int)(win_y + 185), 440, 30, 6, 0x0024283B);
+    draw_rounded_rect_aa((int)(win_x + 20), (int)(win_y + 185), (int)(win_w - 40), 30, 6, 0x0024283B);
     char masked[32]; int p = 0; while(ui_password[p]) { masked[p++] = '*'; } masked[p] = '\0';
     draw_string(masked, win_x + 30, win_y + 191, 0x00FFFFFF, 0x0024283B);
 
     UINT32 btn_bg = (ui_field_focus == 2) ? 0x0000FF00 : 0x001B62D6;
-    draw_rounded_rect_aa((int)(win_x + 140), (int)(win_y + 235), 200, 40, 6, btn_bg);
-    draw_string("Speichern & Disk", win_x + 160, win_y + 245, 0x00000000, btn_bg);
-    draw_string("[ESC] Abbrechen zur Shell", win_x + 120, win_y + 285, 0x00777788, 0x00181A24);
+    draw_rounded_rect_aa((int)(win_x + (win_w - 200) / 2), (int)(win_y + 235), 200, 40, 6, btn_bg);
+    draw_string("Speichern & Disk", win_x + (win_w - 200) / 2 + 20, win_y + 245, 0x00000000, btn_bg);
+    draw_string("[ESC] Abbrechen zur Shell", win_x + 20, win_y + win_h - 35, 0x00777788, 0x00181A24);
     swap_buffers();
 }
 
-void perform_exit_boot_services() {
+void perform_exit_boot_services(void) {
     if (is_bare_metal) return;
 
     mmap.MapSize = 0;
@@ -688,7 +793,7 @@ void perform_exit_boot_services() {
     }
 }
 
-void execute_command() {
+void execute_command(void) {
     if (command_length == 0) return;
     command_buffer[command_length] = '\0';
 
@@ -915,7 +1020,10 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
 
     init_keyboard();
 
+    /* 60 FPS Event-Loop mit sofortiger Auflösungserkennung */
     while (1) {
+        check_screen_resolution_change();
+
         char ascii = poll_keyboard_ascii();
         if (ascii != 0) {
             if (drive_select_mode) {
@@ -931,6 +1039,10 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
             } else {
                 handle_shell_key(ascii);
             }
+        }
+
+        if (system_mode == 3) {
+            desktop_tick_frame();
         }
     }
     return EFI_SUCCESS;

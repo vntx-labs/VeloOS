@@ -1,4 +1,4 @@
-// keyboard.c - PS/2 (i8042) Polling-Treiber fuer Bootloader und Bare Metal
+// keyboard.c - PS/2 (i8042) Polling-Treiber mit sauberer Maus/Tastatur-Kanaltrennung
 #include "keyboard.h"
 
 #define KBC_DATA        0x60
@@ -8,6 +8,7 @@
 
 #define KBC_STAT_OBF    0x01
 #define KBC_STAT_IBF    0x02
+#define KBC_STAT_AUX    0x20
 
 static inline unsigned char inb(unsigned short port) {
     unsigned char result;
@@ -94,17 +95,11 @@ static int kbc_read_data(unsigned char *out) {
 }
 
 static void pic_mask_all(void) {
-    /* Firmware-Timer und USB-IRQs nicht mehr in die alte IDT laufen lassen. */
     outb(0x21, 0xFF);
     outb(0xA1, 0xFF);
     io_wait();
 }
 
-/*
- * Nach ExitBootServices() ist USB-Legacy weg und der 8042 oft mit
- * deaktiviertem Keyboard-Clock zurueckgelassen. Polling auf 0x64/0x60
- * liefert dann nie wieder Daten, obwohl die Shell schon da ist.
- */
 void init_keyboard_bare_metal(void) {
     unsigned char config = 0;
     unsigned char ack = 0;
@@ -112,24 +107,23 @@ void init_keyboard_bare_metal(void) {
     pic_mask_all();
     __asm__ volatile("cli");
 
-    kbc_write_cmd(0xAD); /* Keyboard-Interface aus, solange konfiguriert wird */
-    kbc_write_cmd(0xA7); /* Maus-Interface aus */
+    kbc_write_cmd(0xAD); // Keyboard aus während Config
     kbc_flush();
 
     if (kbc_write_cmd(0x20) && kbc_read_data(&config)) {
-        config &= ~(1u << 0); /* IRQ1 aus: wir pollen */
-        config &= ~(1u << 1); /* IRQ12 aus */
-        config &= ~(1u << 4); /* Keyboard-Clock EIN (Bit4=1 waere Disable) */
-        config |=  (1u << 5); /* Mouse-Clock aus */
-        config |=  (1u << 6); /* Scancode-Set-2 -> Set-1 Uebersetzung */
+        config &= ~(1u << 0); // IRQ1 aus: wir pollen
+        config &= ~(1u << 1); // IRQ12 aus
+        config &= ~(1u << 4); // Keyboard-Clock EIN
+        config &= ~(1u << 5); // Mouse-Clock EIN
+        config |=  (1u << 6); // Scancode-Set-2 -> Set-1 Übersetzung
         if (kbc_write_cmd(0x60)) {
             kbc_write_data(config);
         }
     }
 
-    kbc_write_cmd(0xAE); /* Keyboard-Interface wieder an */
+    kbc_write_cmd(0xAE); // Keyboard Interface wieder an
+    kbc_write_cmd(0xA8); // Mouse Interface wieder an
 
-    /* Enable Scanning: Device-Befehl 0xF4, ACK 0xFA */
     kbc_flush();
     if (kbc_write_data(0xF4)) {
         kbc_read_data(&ack);
@@ -152,7 +146,13 @@ void init_keyboard(void) {
 }
 
 char poll_keyboard_ascii(void) {
-    if (!(inb(KBC_STATUS) & KBC_STAT_OBF)) {
+    unsigned char stat = inb(KBC_STATUS);
+    if (!(stat & KBC_STAT_OBF)) {
+        return 0;
+    }
+
+    // Wenn Bit 5 (0x20) gesetzt ist, sind es Maus-Daten -> nicht für Tastatur verbrauchen!
+    if (stat & KBC_STAT_AUX) {
         return 0;
     }
 
@@ -185,11 +185,11 @@ char poll_keyboard_ascii(void) {
 
     if (scancode == 0x01) {
         e0_prefix = 0;
-        return 0x1B; /* ESC */
+        return 0x1B; // ESC
     }
     if (scancode == 0x3B) {
         e0_prefix = 0;
-        return 0x3B; /* F1 */
+        return 0x3B; // F1
     }
     if (scancode == 0x0F) {
         e0_prefix = 0;
