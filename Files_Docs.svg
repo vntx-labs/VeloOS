@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Inkscape (http://www.inkscape.org/) -->
+
+<svg
+   width="40.891022mm"
+   height="36.073189mm"
+   viewBox="0 0 40.891022 36.073189"
+   version="1.1"
+   id="svg5"
+   inkscape:export-filename="Rastergrafik.svg"
+   inkscape:export-xdpi="21.596092"
+   inkscape:export-ydpi="21.596092"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview7"
+     pagecolor="#505050"
+     bordercolor="#eeeeee"
+     borderopacity="1"
+     inkscape:showpageshadow="0"
+     inkscape:pageopacity="0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#505050"
+     inkscape:document-units="mm"
+     showgrid="false" />
+  <defs
+     id="defs2" />
+  <g
+     inkscape:label="Ebene 1"
+     inkscape:groupmode="layer"
+     id="layer1"
+     transform="translate(-38.208177,-85.218534)">
+    <rect
+       style="fill:#ffffff;stroke-width:0.264583"
+       id="rect1119"
+       width="50.411926"
+       height="53.688614"
+       x="33.358231"
+       y="78.571274" />
+    <text
+       xml:space="preserve"
+       style="font-size:44.2935px;fill:#000080;stroke-width:3.69113"
+       x="55.784302"
+       y="106.33712"
+       id="text518"
+       transform="scale(0.87670559,1.1406338)"><tspan
+         sodipodi:role="line"
+         id="tspan516"
+         style="fill:#000080;stroke-width:3.69113"
+         x="55.784302"
+         y="106.33712">V</tspan></text>
+    <path
+       style="fill:#000080;stroke-width:0.596873"
+       d="m 41.641875,103.66335 c 4.764049,-0.23733 9.536224,-0.0992 14.300415,-0.38288 1.196239,-0.0712 2.390724,-0.19023 3.585762,-0.29278 3.389965,-0.2908 6.79064,-0.59158 10.167852,-1.10358 1.619844,-0.24558 3.703222,-0.66142 5.354088,-1.01349 1.317523,-0.28097 2.777402,-0.47773 4.044214,-1.126097 0.02545,-0.01296 -0.05332,0.01429 -0.0798,0.02249 -0.157071,0.04837 -0.009,-0.01667 -0.212855,0.112604 -0.697816,0.443003 -0.807792,0.515973 -1.751951,0.833313 -1.403714,0.47179 -3.701949,1.06448 -5.092112,1.35132 -3.725328,0.76863 -4.967019,0.89676 -8.80886,1.37383 -4.777116,0.59321 -9.545234,1.07686 -14.34306,1.17113 -2.949818,0.0579 -5.915024,3.7e-4 -8.857986,-0.3153 -0.432638,-0.0463 -0.864588,-0.11191 -1.293495,-0.20267 -0.140048,-0.0296 -0.273478,-0.1024 -0.409334,-0.15769 -0.01673,-0.008 -0.04737,-0.0428 -0.03272,-0.0556 0.004,-0.003 0.01,0 0.01501,0 0.01616,-0.0447 0.02656,-0.0947 0.04865,-0.13441 0.136509,-0.24605 0.251544,-0.52468 0.425707,-0.7207 0.311673,-0.35076 0.658169,-0.64455 1.01515,-0.90087 1.327349,-0.9531 3.07169,-1.7077 4.437182,-2.274717 1.067267,-0.443182 2.142664,-0.851614 3.225548,-1.216182 5.203627,-1.751887 10.486288,-2.757348 15.816655,-3.400807 1.357121,-0.163827 4.14281,-0.457911 5.665187,-0.56305 0.528991,-0.03653 1.05876,-0.04733 1.588214,-0.06755 0.606143,-0.02329 0.528732,-0.02248 0.835034,-0.02248 0.04836,0 -0.09671,0 -0.145069,0"
+       id="path633"
+       inkscape:export-filename="Unknown.svg"
+       inkscape:export-xdpi="21.596092"
+       inkscape:export-ydpi="21.596092" />
+  </g>
+</svg>
