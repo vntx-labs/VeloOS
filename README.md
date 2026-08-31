@@ -1,3 +1,4 @@
+![visitors](https://laobi.icu/badge?page_id=vntx-labs.visitor-badge&left_text=Total%20Visitors%3A&left_color=%231a5fb4&right_color=%231a5fb4&radius=10&height=25)
 # VeloOS
 
 **VeloOS: Fast, minimal, and resilient. A low-level kernel project born from rapid prototyping and persistent debugging. Part of the 'Velo' ecosystem—engineered for performance and open-source collaboration.**
