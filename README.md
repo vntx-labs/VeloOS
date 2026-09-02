@@ -35,5 +35,4 @@ veloos/ \
 ## Build & Ausführung
 Voraussetzungen: nasm, gcc, binutils, python3, qemu-system-x86.
 
-Befehl: \
-make clean && make run
+Befehl: make clean && make run
