@@ -23,17 +23,41 @@ VeloOS V5.0.0 markiert die Geburtsstunde eines vollwertigen Anwendungs-Ökosyste
 
 ## Verzeichnisstruktur
 veloos/ \
-├── include/         # Standard-Header \
-|   ├── velo/        # Syscall- & Window-Schnittstellen \
-│   ├── stdio.h, stdlib.h, string.h, ctype.h \
-├── libc/            # VeloLIBC Quellcode \
-│   └── velolibc.c   # CRT-Startup (_start) & POSIX-Funktionen \
-├── apps/ \
-│   └── explorer.c   # Ring-3 Explorer-Anwendung \
-├── kernel.c         # Kernel Core & Syscall-Vektor \
-├── syscall.c/.h     # Syscall Handler Dispatcher \
-├── wm.c/.h          # Window Surfaces & Compositor \
-└── Makefile         # Kompiliert Kernel und Ring-3-Apps getrennt
+    ├── apps/ \
+    │   └── explorer.c \
+    ├── include/ \
+    │   ├── velo/ \
+    │   │   ├── syscall.h \
+    │   │   └── window.h \
+    │   ├── ctype.h \
+    │   ├── stdio.h \
+    │   ├── stdlib.h \
+    │   └── string.h \
+    ├── libc/ \
+    │   └── velolibc.c \
+    ├── Makefile \
+    ├── ahci.c \
+    ├── ahci.h \
+    ├── desktop.c \
+    ├── desktop.h \
+    ├── fat32.c \
+    ├── fat32.h \
+    ├── font.c \
+    ├── font.h \
+    ├── kernel.c \
+    ├── keyboard.c \
+    ├── keyboard.h \
+    ├── mouse.c \
+    ├── mouse.h \
+    ├── net.c \
+    ├── net.h \
+    ├── setup.c \
+    ├── setup.h \
+    ├── syscall.c \
+    ├── syscall.h \ \
+    ├── user.h \
+    ├── wm.c \
+    └── wm.h
 
 ## Build & Ausführung
 Befehl: make clean && make run
