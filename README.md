@@ -1,42 +1,40 @@
 ![visitors](https://laobi.icu/badge?page_id=vntx-labs.visitor-badge&left_text=Total%20Visitors%3A&left_color=%231a5fb4&right_color=%231a5fb4&radius=10&height=25)
-# VeloOS v2.0.0
+# VeloOS - Version 1.0.0 (Legacy BIOS MBR & ATA-PIO Core)
 
-**VeloOS v2.0.0: UEFI-Native Evolution, AHCI SATA Storage, Advanced FAT32 & Hardware-Accelerated Window Management.**
+VeloOS V1.0.0 ist das Fundament des Betriebssystems. Es implementiert einen klassischen zweistufigen Bootloader (x86 Real Mode nach x86_64 Long Mode) ohne Fremd-Libraries und steuert die Hardware direkt über I/O-Ports und BIOS-Interrupts.
 
----
+## 🚀 Kernmerkmale dieser Version
+- **2-Stage MBR Bootloader:**
+  - `stage1.asm`: 16-Bit Real Mode Bootsektor (0x7C00), aktiviert die A20-Gate-Linie über Port 0x92 und lädt Stage 2 sektorenweise via BIOS `INT 0x13`.
+  - `stage2.asm`: Richtet die GDT ein, schaltet in den 32-Bit Protected Mode, initialisiert ein 1-GB-Identity-Paging (PML4 -> PDPT Huge Page bei `0x20000`) und führt den Far-Jump in das 64-Bit-Codesegment durch.
+- **64-Bit Bare-Metal C-Kernel:**
+  - Direkter VGA-Textmodus-Pufferzugriff bei `0xB8000` (80x25 Zeichen).
+  - Isolierter Programm-Stack (`0x300000`), um Kernel-Stabilität bei Subprozessen zu sichern.
+- **ATA-Festplattentreiber (PIO-Modus):**
+  - Direkte Port-I/O-Ansteuerung über Primär-Kanal (`0x1F0`–`0x1F7`).
+  - Polling über Statusregister (BSY- und DRQ-Bits).
+- **Proprietäres VFS (Virtual File System):**
+  - Generiert durch `mkfs.py`: Schreibt Inodes ab Sektor 40 (32 Byte Name, 4 Byte Start-LBA, 4 Byte Größe).
+- **Interaktive Text-Shell:**
+  - Befehle: `help`, `clear`, `shutdown` (APM/ACPI Port 0x604), `reboot` (8042 Reset Port 0x64), `run <datei>`.
+  - Ausführung eigenständiger Binärprogramme (z. B. `matrix.bin` geladen an `0x400000`).
+- **PS/2 Tastaturtreiber:**
+  - PIC-Remapping (Master: 0x20, Slave: 0x28), IDT-Interrupt-Gate für IRQ 1 (Vektor 0x21), deutsches QWERTZ-Scancode-Mapping mit Shift & AltGr.
 
-## 🌌 Projekt-Übersicht
-
-Mit VeloOS v2.0.0 vollzieht das Projekt den strategischen Sprung von klassischem BIOS-Boot zu einer **modernen UEFI-basierten Architektur**. Das System integriert einen vollständigen AHCI-SATA-Treiber, ein natives FAT32-Dateisystem, einen Bitmap-Font-Renderer und ein grafisches Window-Management-Framework (WM).
-
-### 🔥 Core-Features & Architektur-Meilensteine (v2.0.0)
-* **UEFI Boot-Integration:** Direkter Start in der UEFI-Umgebung mit Nutzung von EFI-Boot-Diensten und stabiler Hardware-Initialisierung.
-* **AHCI SATA-Controller-Treiber (`ahci.c` / `ahci.h`):** Direkte Ansteuerung von SATA-Controllern, Laufwerks-Identifizierung und High-Performance-Sektor-Lese/Schreiboperationen (bis zu 32 Ports).
-* **Vollständiger FAT32-Treiber (`fat32.c` / `fat32.h`):** Integriertes FAT32-Dateisystem inklusive automatischer Formatierungsroutine (`fat32_format`), Cluster-Ketten-Verwaltung, Verzeichnis-Parsing und Datei-E/A.
-* **Grafisches Window-Management (WM & Desktop):** 
-  * Analytische Vektor- und Anti-Aliasing-Primitives mit Subpixel-Blending (`alpha_blend`, Linien, Kreise, abgerundete Rechtecke mit Farbverläufen).
-  * Vollständiges Fenstersystem mit Titel leisten, Fokus-Steuerung, Minimieren, Schließen und automatischem Caching.
-* **Erweiterter Bitmap-Font (`font.c` / `font.h`):** Vollständiger 8x16-Bitmap-Zeichensatz für pixelgenaue Textdarstellung in grafischen Fenstern und Oberflächen.
-* **Anwendungs-Framework (Calc & Matrix):** Integrierte Anwendungen wie ein Rechner (`calc.c`) und eine grafische Matrix-Visualisierung.
-* **Erweitertes Polling-Keyboard (`keyboard.c` / `keyboard.h`):** PS/2 i8042 Polling-Treiber mit robuster Entprellung und Unterstützung für den Betrieb nach `ExitBootServices()`.
-
----
-
-## 📜 Rechtliche Hinweise & Urheberrecht (Copyright Protection)
-
-### ⚠️ STRENGER RECHTLICHER SCHUTZ – URHEBERRECHTSHINWEIS
-**Copyright © 2026 by Vantix (vntx-labs). Alle Rechte vorbehalten.**
-
-Dieses Repository unterliegt dem strengen Schutz des internationalen Urheberrechts. Jegliche unautorisierte Vervielfältigung, kommerzielle Nutzung oder eigenständige Distribution ist strikt untersagt.
-
----
+## 📁 Verzeichnisstruktur
+veloos/
+├── stage1.asm # MBR Bootsektor
+├── stage2.asm # Protected- & Long-Mode Switch
+├── kernel.c # 64-Bit Kernel, Shell & ATA-Treiber
+├── keyboard.c/.h # PS/2 Interrupt-Treiber & Keymaps
+├── matrix.c/.ld # Eigenständige Test-Applikation
+├── linker.ld # Kernel-Linkerskript (Basis 0x7E00)
+├── mkfs.py # VFS-Erstellungsskript
+└── Makefile # Build-System
 
 ## 🛠️ Build & Ausführung
+Voraussetzungen: `nasm`, `gcc`, `binutils`, `python3`, `qemu-system-x86`.
 
-### Voraussetzungen
-UEFI-Toolchain, GCC, Binutils und QEMU mit AHCI-Unterstützung.
-
-### Start
 ```bash
-make clean && make run
-```
+make clean
+make run
