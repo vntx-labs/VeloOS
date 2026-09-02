@@ -1,22 +1,21 @@
 ![visitors](https://laobi.icu/badge?page_id=vntx-labs.visitor-badge&left_text=Total%20Visitors%3A&left_color=%231a5fb4&right_color=%231a5fb4&radius=10&height=25)
-# VeloOS
+# VeloOS v1.0.0
 
-**VeloOS: Fast, minimal, and resilient. A low-level kernel project born from rapid prototyping and persistent debugging. Part of the 'Velo' ecosystem—engineered for performance and open-source collaboration.**
+**VeloOS: Fast, minimal, and resilient. A low-level 64-bit kernel project born from rapid prototyping and persistent debugging.**
 
 ---
 
 ## 🌌 Projekt-Übersicht
 
-VeloOS ist ein von Grund auf selbst entwickeltes, **hoch-modulares 64-Bit Bare-Metal-Betriebssystem**, das den nackten x86_64-Long-Mode direkt außerhalb der UEFI-Umgebung kontrolliert. Das System verzichtet komplett auf bestehende Linux- oder Windows-Kernelstrukturen und setzt auf eine vertikal integrierte Grafik- und Input-Pipeline für maximale Performance bei absoluter Null-Latenz.
+VeloOS v1.0.0 ist ein von Grund auf selbst entwickeltes, **hoch-modulares 64-Bit Bare-Metal-Betriebssystem**, das den nackten x86_64-Long-Mode direkt steuert. Das System verzichtet komplett auf bestehende Kernelstrukturen und implementiert eine eigene Low-Level-Architektur für maximale Performance.
 
-### 🔥 Core-Features & Architektur-Meilensteine
-* **Präemptives Multitasking:** Ein hardwarenaher Scheduler in `sched.c`, der Threads (wie den GUI-Compositor und die Netzwerk-Services) über den APIC-Timer-Interrupt (100 Hz Ticks) im fliegenden Wechsel synchronisiert.
-* **Windows Vista Aero GUI Framework:** Ein ultraschnelles 2D-Rendering-System im Ring 0/3 mit dynamischer Laufzeit-Skalierung (Resolution Switching). Berechnet mathematische Farbverläufe, Kanten-Radius-Spans und bitweises, divisionsfreies Parallel-Alpha-Blending direkt im Triple-Buffer-Backbuffer.
-* **Eigene Standard-Bibliothek (VeloLIBC):** Eine proprietäre, POSIX-ähnliche `libc`, die die Brücke zwischen hardwaregeschütztem Ring-3-Userland und dem Kernel über den modernen `syscall`/`sysret`-Mechanismus schlägt.
-* **Persistent Storage (AHCI & FAT32):** Eigene native Sektor-Treiber für SATA-Festplatten, die Partitionsdaten fehlerfrei über den AHCI-Controller einlesen und beschreiben.
-* **Netzwerk- & Krypto-Stack:** Ein integrierter Intel e1000 Gigabit-Netzwerktreiber mit DHCP-Lease und funktionierendem HTTPS/TLS-Handshake im Kernel für sichere, verschlüsselte Live-Abfragen.
-* **0-Delay CMOS RTC:** Sekundengenaue Hardware-Zeitsynchronisation direkt über die I/O-Ports des Mainboard-CMOS-Chips inklusive dynamischer Sommer-/Winterzeit-RAM-Lookup-Tabellen.
-
+### 🔥 Core-Features & Architektur-Meilensteine (v1.0.0)
+* **Real-to-Protected-to-Long-Mode Transition:** Robuster Bootloader (`stage1.asm`, `stage2.asm`) mit aktiviertem A20-Gate, GDT-Setup, 1-GB-Identity-Mapping und Sprung in den 64-Bit Long Mode.
+* **C-Kernel & Interrupt-Management:** Eigenständiger 64-Bit C-Kernel (`kernel.c`) mit PIC-Remapping, IDT-Registrierung und sicherer Interrupt Service Routine (ISR) für die Tastatur.
+* **Robustes Tastatur-Subsystem:** Vollständiger PS/2-Tastaturtreiber (`keyboard.c`, `keyboard.h`) mit deutscher Keymap (Normal, Shift, AltGr), Extended-Mode-Unterstützung (0xE0) und Puffer-Bereinigung.
+* **Persistent Disk VFS (Virtual File System):** Eigenes Sektor-basiertes Dateisystem (`mkfs.py`), das Anwendungen wie den Matrix-Screensaver dynamisch ab Sektor 41 speichert und zur Laufzeit lädt.
+* **Isolierter Userspace-Stack:** Sichere Programmausführung bei `0x400000` mit getrenntem Userspace-Stack (`0x300000`), um den Kernel-Stack vor Überläufen zu schützen.
+* **Matrix-Screensaver:** Visuelle Demo-Anwendung (`matrix.c`), die eigenständig im Long Mode läuft und per ESC-Taste beendet werden kann.
 
 ---
 
@@ -25,34 +24,23 @@ VeloOS ist ein von Grund auf selbst entwickeltes, **hoch-modulares 64-Bit Bare-M
 ### ⚠️ STRENGER RECHTLICHER SCHUTZ – URHEBERRECHTSHINWEIS
 **Copyright © 2026 by Vantix (vntx-labs). Alle Rechte vorbehalten.**
 
-Dieses Betriebssystem-Repository, einschließlich aller Quellcodes (`.c`, `.h`), Assembler-Dateien, Skripte, Makefiles, Binärdaten und visuellen Assets (Vantix-Logo-Schwung, optimierte Ordner-Icons), unterliegt dem **strengen Schutz des internationalen Urheberrechts (Copyright Law)**.
+Dieses Betriebssystem-Repository, einschließlich aller Quellcodes (`.c`, `.h`), Assembler-Dateien, Skripte, Makefiles und Binärdaten unterliegt dem **strengen Schutz des internationalen Urheberrechts (Copyright Law)**.
 
-* **Keine unautorisierte Vervielfältigung (No Derivates / No Cloning):** Es ist strikt untersagt, den Code dieses Projekts zu kopieren, zu klonen, in eigene Repositories zu forken (außer zum Zweck von Pull Requests an dieses Upstream-Projekt), unter anderem Namen zu veröffentlichen oder Teile davon in andere Projekte einzubauen.
-* **Keine kommerzielle Nutzung:** Jegliche kommerzielle Verwertung, Nutzung in proprietären Systemen oder der Verkauf von Binär-Images (`.efi`, `.img`), die auf diesem Code basieren, ist illegal und wird rechtlich verfolgt.
-* **Anonymitätsschutz:** Die Identität des Kern-Entwicklers (**Vantix / vntx-labs**) ist im digitalen Raum vollständig isoliert und geschützt. Jegliche Versuche, diese Online-Identität mit realen Identitäten zu verknüpfen, verletzen die Privatsphäre und haben rechtliche Konsequenzen.
-
-### 🤝 Bestimmungen zur Mitarbeit (Contribution Policy)
-Wie in der beiliegenden `LICENSE` definiert, ist eine **Mitarbeit und Code-Kooperation ausdrücklich erlaubt und erwünscht**, solange sie unter folgenden Bedingungen stattfindet:
-
-1. **Pull Requests:** Code-Verbesserungen, Bugfixes (z. B. beim FAT32-Unterverzeichnis-Routing) und Feature-Erweiterungen müssen über offizielle Pull Requests eingereicht werden.
-2. **Rechteübertragung:** Mit dem Einreichen eines Pull Requests oder Beitrags stimmst du zu, dass dein bereitgestellter Code automatisch Teil des geschützten VeloOS-Ökosystems wird und den gleichen strengen Urheberrechtsbestimmungen von Vantix unterliegt.
-3. **Open-Source-Erhalt:** Das Projekt bleibt als kollaboratives Low-Level-Meisterwerk sichtbar, ist aber vor Diebstahl und unautorisierten Forks geschützt.
+* **Keine unautorisierte Vervielfältigung (No Derivates / No Cloning):** Es ist strikt untersagt, den Code dieses Projekts zu kopieren, zu klonen, in eigene Repositories zu forken oder unter anderem Namen zu veröffentlichen.
+* **Keine kommerzielle Nutzung:** Jegliche kommerzielle Verwertung oder Nutzung in proprietären Systemen ist illegal.
 
 ---
 
 ## 🛠️ Build & Ausführung (Host-Setup)
 
-Um VeloOS mit nativer Hardware-Geschwindigkeit und absolutem 0-Lag auf deinem Linux Mint-System zu emulieren, wird ein Prozessor-Passthrough benötigt.
-
 ### Voraussetzungen
 ```bash
 sudo apt update
-sudo apt install gcc binutils make mtools qemu-system-x86
+sudo apt install gcc binutils make nasm genisoimage qemu-system-x86 python3
 ```
 
 ### Compilation & Start
 ```bash
 make clean && make run
 ```
-*Das Makefile baut automatisch die `velolibc.a`, kompiliert die Ring-3-Apps (`EXPLORER.BIN`) und startet QEMU mit aktivierter KVM-Hardwarebeschleunigung (`-cpu host`).*
-
+*Das Makefile kompiliert Stage 1, Stage 2, den C-Kernel, das Tastatur-Subsystem sowie das Matrix-Program, baut das VFS via `mkfs.py` und startet QEMU.*
