@@ -1,40 +1,45 @@
 ![visitors](https://laobi.icu/badge?page_id=vntx-labs.visitor-badge&left_text=Total%20Visitors%3A&left_color=%231a5fb4&right_color=%231a5fb4&radius=10&height=25)
-# VeloOS - Version 1.0.0 (Legacy BIOS MBR & ATA-PIO Core)
+# VeloOS - Version 2.0.0 (UEFI Native, AHCI SATA & FAT32)
 
-VeloOS V1.0.0 ist das Fundament des Betriebssystems. Es implementiert einen klassischen zweistufigen Bootloader (x86 Real Mode nach x86_64 Long Mode) ohne Fremd-Libraries und steuert die Hardware direkt über I/O-Ports und BIOS-Interrupts.
+VeloOS V2.0.0 vollzieht den technologischen Paradigmenwechsel: Abkehr vom veralteten 16-Bit BIOS hin zum modernen UEFI-Standard mit nativer Hardware-Grafik (GOP), echtem SATA-AHCI-Controller-Zugriff und vollständiger FAT32-Dateisystemunterstützung.
 
-## 🚀 Kernmerkmale dieser Version
-- **2-Stage MBR Bootloader:**
-  - `stage1.asm`: 16-Bit Real Mode Bootsektor (0x7C00), aktiviert die A20-Gate-Linie über Port 0x92 und lädt Stage 2 sektorenweise via BIOS `INT 0x13`.
-  - `stage2.asm`: Richtet die GDT ein, schaltet in den 32-Bit Protected Mode, initialisiert ein 1-GB-Identity-Paging (PML4 -> PDPT Huge Page bei `0x20000`) und führt den Far-Jump in das 64-Bit-Codesegment durch.
-- **64-Bit Bare-Metal C-Kernel:**
-  - Direkter VGA-Textmodus-Pufferzugriff bei `0xB8000` (80x25 Zeichen).
-  - Isolierter Programm-Stack (`0x300000`), um Kernel-Stabilität bei Subprozessen zu sichern.
-- **ATA-Festplattentreiber (PIO-Modus):**
-  - Direkte Port-I/O-Ansteuerung über Primär-Kanal (`0x1F0`–`0x1F7`).
-  - Polling über Statusregister (BSY- und DRQ-Bits).
-- **Proprietäres VFS (Virtual File System):**
-  - Generiert durch `mkfs.py`: Schreibt Inodes ab Sektor 40 (32 Byte Name, 4 Byte Start-LBA, 4 Byte Größe).
-- **Interaktive Text-Shell:**
-  - Befehle: `help`, `clear`, `shutdown` (APM/ACPI Port 0x604), `reboot` (8042 Reset Port 0x64), `run <datei>`.
-  - Ausführung eigenständiger Binärprogramme (z. B. `matrix.bin` geladen an `0x400000`).
-- **PS/2 Tastaturtreiber:**
-  - PIC-Remapping (Master: 0x20, Slave: 0x28), IDT-Interrupt-Gate für IRQ 1 (Vektor 0x21), deutsches QWERTZ-Scancode-Mapping mit Shift & AltGr.
+## Neuheiten & Meilensteine
+- UEFI Boot-Architektur:
+  - Kompiliert als 64-Bit PE32+ Binary (BOOTX64.EFI) über GNU-EFI.
+  - Sichere Speicherallokation und sauberer Übergang mit ExitBootServices().
+- GOP Hi-Res Grafik-Engine:
+  - Native 32-Bit Framebuffer-Unterstützung (BGR/RGB).
+  - Software-Double-Buffering (g_backbuffer) mit Pitch-/Scanline-Blit zur Vermeidung von Bildversatz.
+  - Vollständiger 8x16 Bitmap-Font (font.c) für formatierte Textausgabe.
+- SATA AHCI Treiber (ahci.c):
+  - Vollständiger PCI-Bus-Scan (Bus 0-255, Device 0-31, Function 0-7) nach Speichercontrollern (Klasse 0x01).
+  - Konfiguration der HBA Memory Space Register (ABAR BAR5), Port-Initialisierung, Command Lists & PRDT-DMA-Transfers.
+  - Automatische Erkennung und IDENTIFY DRIVE-Abfrage für SATA-Platten.
+- Vollwertiger FAT32-Treiber (fat32.c):
+  - Boot Record (BPB) Parser, Cluster-Chain-Traversal und dynamische Cluster-Allokation.
+  - Integrierte bare-metal Formatierfunktion (fat32_format) zur Laufzeit.
+  - Lesen und Schreiben regulärer Dateien über Verzeichniseinträge.
+- Persistentes Benutzer-Setup:
+  - Dateibasierte Account-Verwaltung auf Festplatte (ACCOUNT.DAT) inklusive XOR-Verschlüsselung.
+  - Login-Screen und grafischer Account-Erstellungs-Assistent.
+- Desktop Environment V1 (desktop.c / wm.c):
+  - Lineare mathematische Farbverläufe und zentriertes Vektor-Logo mit analytischem Anti-Aliasing (Subpixel-Blending).
+  - Fenster-Manager mit Fenstertiteln, Close-Buttons und Fokus-Wechsel (Tab).
+  - CMOS-RTC-Echtzeituhr in der Taskleiste.
 
-## 📁 Verzeichnisstruktur
+## Verzeichnisstruktur
 veloos/ \
-├── stage1.asm # MBR Bootsektor \
-├── stage2.asm # Protected- & Long-Mode Switch \
-├── kernel.c # 64-Bit Kernel, Shell & ATA-Treiber \
-├── keyboard.c/.h # PS/2 Interrupt-Treiber & Keymaps \
-├── matrix.c/.ld # Eigenständige Test-Applikation \
-├── linker.ld # Kernel-Linkerskript (Basis 0x7E00) \
-├── mkfs.py # VFS-Erstellungsskript \
-└── Makefile # Build-System
+├── kernel.c         # UEFI Main & Core-Subsysteme \
+├── ahci.c/.h        # PCI AHCI SATA Treiber (DMA) \
+├── fat32.c/.h       # FAT32 Lese-/Schreib-/Formatiertreiber \
+├── keyboard.c/.h    # Non-blocking PS/2 Keyboard Poller \
+├── font.c/.h        # 8x16 Raster-Font \
+├── desktop.c/.h     # Grafische Desktop-Oberfläche \
+├── wm.c/.h          # Window Manager & 2D AA-Primitives \
+├── calc.c           # Bare-Metal Rechner mit Syntaxbaum \
+└── Makefile         # UEFI Image Builder (os.img, data.img) \
 
-## 🛠️ Build & Ausführung
-Voraussetzungen: `nasm`, `gcc`, `binutils`, `python3`, `qemu-system-x86`.
+## Build & Ausführung
+Voraussetzungen: gcc, gnu-efi, mtools, dosfstools, qemu-system-x86, ovmf.
 
-```bash
-make clean
-make run
+Befehl: make clean && make run
