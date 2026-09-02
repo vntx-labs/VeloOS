@@ -1,46 +1,40 @@
 ![visitors](https://laobi.icu/badge?page_id=vntx-labs.visitor-badge&left_text=Total%20Visitors%3A&left_color=%231a5fb4&right_color=%231a5fb4&radius=10&height=25)
-# VeloOS v1.0.0
+# VeloOS - Version 1.0.0 (Legacy BIOS MBR & ATA-PIO Core)
 
-**VeloOS: Fast, minimal, and resilient. A low-level 64-bit kernel project born from rapid prototyping and persistent debugging.**
+VeloOS V1.0.0 ist das Fundament des Betriebssystems. Es implementiert einen klassischen zweistufigen Bootloader (x86 Real Mode nach x86_64 Long Mode) ohne Fremd-Libraries und steuert die Hardware direkt über I/O-Ports und BIOS-Interrupts.
 
----
+## 🚀 Kernmerkmale dieser Version
+- **2-Stage MBR Bootloader:**
+  - `stage1.asm`: 16-Bit Real Mode Bootsektor (0x7C00), aktiviert die A20-Gate-Linie über Port 0x92 und lädt Stage 2 sektorenweise via BIOS `INT 0x13`.
+  - `stage2.asm`: Richtet die GDT ein, schaltet in den 32-Bit Protected Mode, initialisiert ein 1-GB-Identity-Paging (PML4 -> PDPT Huge Page bei `0x20000`) und führt den Far-Jump in das 64-Bit-Codesegment durch.
+- **64-Bit Bare-Metal C-Kernel:**
+  - Direkter VGA-Textmodus-Pufferzugriff bei `0xB8000` (80x25 Zeichen).
+  - Isolierter Programm-Stack (`0x300000`), um Kernel-Stabilität bei Subprozessen zu sichern.
+- **ATA-Festplattentreiber (PIO-Modus):**
+  - Direkte Port-I/O-Ansteuerung über Primär-Kanal (`0x1F0`–`0x1F7`).
+  - Polling über Statusregister (BSY- und DRQ-Bits).
+- **Proprietäres VFS (Virtual File System):**
+  - Generiert durch `mkfs.py`: Schreibt Inodes ab Sektor 40 (32 Byte Name, 4 Byte Start-LBA, 4 Byte Größe).
+- **Interaktive Text-Shell:**
+  - Befehle: `help`, `clear`, `shutdown` (APM/ACPI Port 0x604), `reboot` (8042 Reset Port 0x64), `run <datei>`.
+  - Ausführung eigenständiger Binärprogramme (z. B. `matrix.bin` geladen an `0x400000`).
+- **PS/2 Tastaturtreiber:**
+  - PIC-Remapping (Master: 0x20, Slave: 0x28), IDT-Interrupt-Gate für IRQ 1 (Vektor 0x21), deutsches QWERTZ-Scancode-Mapping mit Shift & AltGr.
 
-## 🌌 Projekt-Übersicht
+## 📁 Verzeichnisstruktur
+veloos/ \
+├── stage1.asm # MBR Bootsektor \
+├── stage2.asm # Protected- & Long-Mode Switch \
+├── kernel.c # 64-Bit Kernel, Shell & ATA-Treiber \
+├── keyboard.c/.h # PS/2 Interrupt-Treiber & Keymaps \
+├── matrix.c/.ld # Eigenständige Test-Applikation \
+├── linker.ld # Kernel-Linkerskript (Basis 0x7E00) \
+├── mkfs.py # VFS-Erstellungsskript \
+└── Makefile # Build-System
 
-VeloOS v1.0.0 ist ein von Grund auf selbst entwickeltes, **hoch-modulares 64-Bit Bare-Metal-Betriebssystem**, das den nackten x86_64-Long-Mode direkt steuert. Das System verzichtet komplett auf bestehende Kernelstrukturen und implementiert eine eigene Low-Level-Architektur für maximale Performance.
+## 🛠️ Build & Ausführung
+Voraussetzungen: `nasm`, `gcc`, `binutils`, `python3`, `qemu-system-x86`.
 
-### 🔥 Core-Features & Architektur-Meilensteine (v1.0.0)
-* **Real-to-Protected-to-Long-Mode Transition:** Robuster Bootloader (`stage1.asm`, `stage2.asm`) mit aktiviertem A20-Gate, GDT-Setup, 1-GB-Identity-Mapping und Sprung in den 64-Bit Long Mode.
-* **C-Kernel & Interrupt-Management:** Eigenständiger 64-Bit C-Kernel (`kernel.c`) mit PIC-Remapping, IDT-Registrierung und sicherer Interrupt Service Routine (ISR) für die Tastatur.
-* **Robustes Tastatur-Subsystem:** Vollständiger PS/2-Tastaturtreiber (`keyboard.c`, `keyboard.h`) mit deutscher Keymap (Normal, Shift, AltGr), Extended-Mode-Unterstützung (0xE0) und Puffer-Bereinigung.
-* **Persistent Disk VFS (Virtual File System):** Eigenes Sektor-basiertes Dateisystem (`mkfs.py`), das Anwendungen wie den Matrix-Screensaver dynamisch ab Sektor 41 speichert und zur Laufzeit lädt.
-* **Isolierter Userspace-Stack:** Sichere Programmausführung bei `0x400000` mit getrenntem Userspace-Stack (`0x300000`), um den Kernel-Stack vor Überläufen zu schützen.
-* **Matrix-Screensaver:** Visuelle Demo-Anwendung (`matrix.c`), die eigenständig im Long Mode läuft und per ESC-Taste beendet werden kann.
-
----
-
-## 📜 Rechtliche Hinweise & Urheberrecht (Copyright Protection)
-
-### ⚠️ STRENGER RECHTLICHER SCHUTZ – URHEBERRECHTSHINWEIS
-**Copyright © 2026 by Vantix (vntx-labs). Alle Rechte vorbehalten.**
-
-Dieses Betriebssystem-Repository, einschließlich aller Quellcodes (`.c`, `.h`), Assembler-Dateien, Skripte, Makefiles und Binärdaten unterliegt dem **strengen Schutz des internationalen Urheberrechts (Copyright Law)**.
-
-* **Keine unautorisierte Vervielfältigung (No Derivates / No Cloning):** Es ist strikt untersagt, den Code dieses Projekts zu kopieren, zu klonen, in eigene Repositories zu forken oder unter anderem Namen zu veröffentlichen.
-* **Keine kommerzielle Nutzung:** Jegliche kommerzielle Verwertung oder Nutzung in proprietären Systemen ist illegal.
-
----
-
-## 🛠️ Build & Ausführung (Host-Setup)
-
-### Voraussetzungen
 ```bash
-sudo apt update
-sudo apt install gcc binutils make nasm genisoimage qemu-system-x86 python3
-```
-
-### Compilation & Start
-```bash
-make clean && make run
-```
-*Das Makefile kompiliert Stage 1, Stage 2, den C-Kernel, das Tastatur-Subsystem sowie das Matrix-Program, baut das VFS via `mkfs.py` und startet QEMU.*
+make clean
+make run
