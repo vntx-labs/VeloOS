@@ -22,14 +22,14 @@ VeloOS V1.0.0 ist das Fundament des Betriebssystems. Es implementiert einen klas
   - PIC-Remapping (Master: 0x20, Slave: 0x28), IDT-Interrupt-Gate für IRQ 1 (Vektor 0x21), deutsches QWERTZ-Scancode-Mapping mit Shift & AltGr.
 
 ## Verzeichnisstruktur
-veloos/
-├── stage1.asm       # MBR Bootsektor
-├── stage2.asm       # Protected- & Long-Mode Switch
-├── kernel.c         # 64-Bit Kernel, Shell & ATA-Treiber
-├── keyboard.c/.h    # PS/2 Interrupt-Treiber & Keymaps
-├── matrix.c/.ld     # Eigenständige Test-Applikation
-├── linker.ld        # Kernel-Linkerskript (Basis 0x7E00)
-├── mkfs.py          # VFS-Erstellungsskript
+veloos/ \
+├── stage1.asm       # MBR Bootsektor \
+├── stage2.asm       # Protected- & Long-Mode Switch \
+├── kernel.c         # 64-Bit Kernel, Shell & ATA-Treiber \
+├── keyboard.c/.h    # PS/2 Interrupt-Treiber & Keymaps \
+├── matrix.c/.ld     # Eigenständige Test-Applikation \
+├── linker.ld        # Kernel-Linkerskript (Basis 0x7E00) \
+├── mkfs.py          # VFS-Erstellungsskript \
 └── Makefile         # Build-System
 
 ## Build & Ausführung
