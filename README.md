@@ -1,57 +1,75 @@
-# VeloOS
+# V12 Operating System
 
-**VeloOS: Fast, minimal, and resilient. A low-level kernel project born from rapid prototyping and persistent debugging. Part of the 'Velo' ecosystem—engineered for performance and open-source collaboration.**
-
----
-
-## 🌌 Projekt-Übersicht
-
-VeloOS ist ein von Grund auf selbst entwickeltes, **hoch-modulares 64-Bit Bare-Metal-Betriebssystem**, das den nackten x86_64-Long-Mode direkt außerhalb der UEFI-Umgebung kontrolliert. Das System verzichtet komplett auf bestehende Linux- oder Windows-Kernelstrukturen und setzt auf eine vertikal integrierte Grafik- und Input-Pipeline für maximale Performance bei absoluter Null-Latenz.
-
-### 🔥 Core-Features & Architektur-Meilensteine
-* **Präemptives Multitasking:** Ein hardwarenaher Scheduler in `sched.c`, der Threads (wie den GUI-Compositor und die Netzwerk-Services) über den APIC-Timer-Interrupt (100 Hz Ticks) im fliegenden Wechsel synchronisiert.
-* **Windows Vista Aero GUI Framework:** Ein ultraschnelles 2D-Rendering-System im Ring 0/3 mit dynamischer Laufzeit-Skalierung (Resolution Switching). Berechnet mathematische Farbverläufe, Kanten-Radius-Spans und bitweises, divisionsfreies Parallel-Alpha-Blending direkt im Triple-Buffer-Backbuffer.
-* **Eigene Standard-Bibliothek (VeloLIBC):** Eine proprietäre, POSIX-ähnliche `libc`, die die Brücke zwischen hardwaregeschütztem Ring-3-Userland und dem Kernel über den modernen `syscall`/`sysret`-Mechanismus schlägt.
-* **Persistent Storage (AHCI & FAT32):** Eigene native Sektor-Treiber für SATA-Festplatten, die Partitionsdaten fehlerfrei über den AHCI-Controller einlesen und beschreiben.
-* **Netzwerk- & Krypto-Stack:** Ein integrierter Intel e1000 Gigabit-Netzwerktreiber mit DHCP-Lease und funktionierendem HTTPS/TLS-Handshake im Kernel für sichere, verschlüsselte Live-Abfragen.
-* **0-Delay CMOS RTC:** Sekundengenaue Hardware-Zeitsynchronisation direkt über die I/O-Ports des Mainboard-CMOS-Chips inklusive dynamischer Sommer-/Winterzeit-RAM-Lookup-Tabellen.
-
+V12 is an advanced, custom-built 64-bit operating system kernel for x86_64 architectures, written in C and built from scratch. It boots via UEFI, features its own custom graphical compositor, window manager, FAT32 file system driver, NVMe/AHCI disk controllers, TCP/IP network stack, ELF64 userland executable loader, POSIX-compatible command line utilities, and the `litehtml` rendering engine integration.
 
 ---
 
-## 📜 Rechtliche Hinweise & Urheberrecht (Copyright Protection)
+## 🚀 Key Features
 
-### ⚠️ STRENGER RECHTLICHER SCHUTZ – URHEBERRECHTSHINWEIS
-**Copyright © 2026 by Vantix (vntx-labs). Alle Rechte vorbehalten.**
-
-Dieses Betriebssystem-Repository, einschließlich aller Quellcodes (`.c`, `.h`), Assembler-Dateien, Skripte, Makefiles, Binärdaten und visuellen Assets (Vantix-Logo-Schwung, optimierte Ordner-Icons), unterliegt dem **strengen Schutz des internationalen Urheberrechts (Copyright Law)**.
-
-* **Keine unautorisierte Vervielfältigung (No Derivates / No Cloning):** Es ist strikt untersagt, den Code dieses Projekts zu kopieren, zu klonen, in eigene Repositories zu forken (außer zum Zweck von Pull Requests an dieses Upstream-Projekt), unter anderem Namen zu veröffentlichen oder Teile davon in andere Projekte einzubauen.
-* **Keine kommerzielle Nutzung:** Jegliche kommerzielle Verwertung, Nutzung in proprietären Systemen oder der Verkauf von Binär-Images (`.efi`, `.img`), die auf diesem Code basieren, ist illegal und wird rechtlich verfolgt.
-* **Anonymitätsschutz:** Die Identität des Kern-Entwicklers (**Vantix / vntx-labs**) ist im digitalen Raum vollständig isoliert und geschützt. Jegliche Versuche, diese Online-Identität mit realen Identitäten zu verknüpfen, verletzen die Privatsphäre und haben rechtliche Konsequenzen.
-
-### 🤝 Bestimmungen zur Mitarbeit (Contribution Policy)
-Wie in der beiliegenden `LICENSE` definiert, ist eine **Mitarbeit und Code-Kooperation ausdrücklich erlaubt und erwünscht**, solange sie unter folgenden Bedingungen stattfindet:
-
-1. **Pull Requests:** Code-Verbesserungen, Bugfixes (z. B. beim FAT32-Unterverzeichnis-Routing) und Feature-Erweiterungen müssen über offizielle Pull Requests eingereicht werden.
-2. **Rechteübertragung:** Mit dem Einreichen eines Pull Requests oder Beitrags stimmst du zu, dass dein bereitgestellter Code automatisch Teil des geschützten VeloOS-Ökosystems wird und den gleichen strengen Urheberrechtsbestimmungen von Vantix unterliegt.
-3. **Open-Source-Erhalt:** Das Projekt bleibt als kollaboratives Low-Level-Meisterwerk sichtbar, ist aber vor Diebstahl und unautorisierten Forks geschützt.
+- **UEFI Boot & Native Graphics (GOP):** Boots natively via UEFI with a custom Graphics Output Protocol (GOP) linear framebuffer compositor supporting multi-buffering and dynamic resolution switching.
+- **Multitasking & Scheduler:** Preemptive round-robin scheduler supporting kernel and user tasks with isolated address spaces and automated page-fault handling.
+- **Virtual Memory & Paging (PMM/VMM):** Robust Physical Memory Manager (PMM) and Virtual Memory Manager (VMM) with x86_64 4-level paging and demand paging.
+- **Window Manager (WM):** Fully-featured graphical window manager supporting window decoration, moving, resizing, minimize/maximize, modal dialogs, and native widget rendering (buttons, icons, storage bars, searchboxes).
+- **Storage Subsystem:** Native drivers for AHCI (SATA) and NVMe controllers coupled with an integrated FAT32 file system parser and virtual path resolution (`C:`, `/bin`, `/Programs`).
+- **Networking Stack:** Integrated network driver stack supporting DHCP, DNS resolution, TCP sockets, TLS bridging, and synchronous/asynchronous HTTP client requests.
+- **ELF64 Userland & Executable Loader:** Supports running dynamic ELF64 user binaries with `R_X86_64_RELATIVE` relocation support, protected user ring-3 transitions, and system call interface (`int 0x80`).
+- **TTY & Rescue Shell:** Multi-TTY management (`Ctrl+Alt+1` through `8`) allowing seamless switching between the graphical desktop environment and kernel/emergency shells (`kshell`).
 
 ---
 
-## 🛠️ Build & Ausführung (Host-Setup)
+## 📁 Directory Structure
 
-Um VeloOS mit nativer Hardware-Geschwindigkeit und absolutem 0-Lag auf deinem Linux Mint-System zu emulieren, wird ein Prozessor-Passthrough benötigt.
-
-### Voraussetzungen
-```bash
-sudo apt update
-sudo apt install gcc binutils make mtools qemu-system-x86
+```text
+V12/
+├── apps/                 # Graphical applications (Browser, Explorer, Notepad, Shell)
+├── bin/                  # Source files for core CLI command-line utilities (cat, cp, ls, grep, etc.)
+├── bin_out/              # Compiled binary outputs (.BIN)
+├── include/              # Public headers (libc headers & Velo OS system interfaces)
+├── libc/                 # Velibc runtime support library
+├── libs/                 # External libraries (litehtml HTML rendering engine, cxx_runtime)
+├── ahci.c / .h           # AHCI SATA disk controller driver
+├── nvme.c / .h           # NVMe storage controller driver
+├── fat32.c / .h          # FAT32 file system driver
+├── kernel.c              # Main kernel entry, GOP initialization, and GUI/Network workers
+├── sched.c / .h          # Preemptive task scheduler, IDT/GDT setup, and exception handlers
+├── syscall.c / .h        # System call dispatcher and ELF64 loader
+├── wm.c / .h             # Window manager and graphical compositor
+├── net.c / .h            # Network stack, sockets, DNS, and HTTP implementation
+├── keyboard.c / .h       # Keyboard driver with QWERTZ/QWERTY layout translation
+├── mouse.c / .h          # Mouse driver and cursor management
+├── desktop.c / .h        # Graphical desktop environment & launcher
+└── Makefile              # Build configuration for compilation and ISO generation
 ```
 
-### Compilation & Start
-```bash
-make clean && make run
-```
-*Das Makefile baut automatisch die `velolibc.a`, kompiliert die Ring-3-Apps (`EXPLORER.BIN`) und startet QEMU mit aktivierter KVM-Hardwarebeschleunigung (`-cpu host`).*
+---
 
+## 🛠️ Build & Compilation
+
+To build the V12 operating system image and compile all associated binaries and user applications, ensure you have an x86_64 cross-compiler toolchain (`x86_64-elf-gcc` or equivalent) and standard build utilities installed.
+
+```bash
+# Clone or navigate to the V12 root directory
+cd V12
+
+# Build kernel, binaries, and generate the bootable ISO image
+make
+```
+
+### Generated Targets
+- `kernel.efi`: UEFI kernel executable.
+- `*.BIN`: Compiled user space binaries.
+- `velo.iso`: Complete bootable OS ISO image.
+
+---
+
+## ⌨️ Shortcuts & Controls
+
+- **`Ctrl + Alt + 1`**: Switch to Desktop Environment (TTY 1).
+- **`Ctrl + Alt + 2` – `8`**: Switch to Emergency Kernel Shells / TTYs.
+- **Window Controls**: Title bar drag to move, window border handles to resize, and native button handlers for close/maximize.
+
+---
+
+## 📄 License
+
+Distributed under the terms of the included LICENSE file. Refer to individual library directories (such as `litehtml`) for their respective licensing terms.
