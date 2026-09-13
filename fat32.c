@@ -1,0 +1,1171 @@
+#include "fat32.h"
+#include "ahci.h"
+
+#define MAX_VOLUMES 8
+#define FAT_EOC           0x0FFFFFF8U
+#define FAT_BAD           0x0FFFFFF7U
+#define FAT_FREE          0x00000000U
+#define FAT32_MAX_CLUSTER 0x0FFFFFF6U
+
+typedef struct {
+    void *port;
+    UINT32 lba_offset;
+    FAT32_BPB bpb;
+    UINT32 first_data_sector;
+    UINT32 bytes_per_cluster;
+    UINT32 total_clusters;
+    UINT64 cached_free_bytes;
+    UINT32 last_free_cluster_hint;
+    int initialized;
+} FAT32_VOLUME;
+
+typedef struct {
+    UINT8  order;
+    UINT16 name1[5];
+    UINT8  attr;
+    UINT8  type;
+    UINT8  checksum;
+    UINT16 name2[6];
+    UINT16 zero;
+    UINT16 name3[2];
+} __attribute__((packed)) FAT32_LFN_ENTRY;
+
+static FAT32_VOLUME g_volumes[MAX_VOLUMES] = {0};
+static UINT8 g_fat32_io_buf[131072] __attribute__((aligned(4096)));
+
+static FAT32_VOLUME* get_volume(void *port);
+static UINT32 get_next_cluster(FAT32_VOLUME *vol, UINT32 cluster);
+static int    set_next_cluster(FAT32_VOLUME *vol, UINT32 cluster, UINT32 value);
+static UINT32 find_free_cluster(FAT32_VOLUME *vol);
+static UINT32 cluster_to_lba(FAT32_VOLUME *vol, UINT32 cluster);
+static int    valid_cluster(FAT32_VOLUME *vol, UINT32 cluster);
+static int    is_eoc(UINT32 cluster);
+static UINT32 fat_sector_for_cluster(FAT32_VOLUME *vol, UINT32 cluster);
+static UINT32 fat_offset_in_sector(FAT32_VOLUME *vol, UINT32 cluster);
+static void   to_fat_name(const char *filename, char *fat_name);
+static void   fat_name_to_string(const UINT8 *fat_name, char *out, int is_dir);
+static inline int fat_names_match(const UINT8 *fat_name1, const char *fat_name2);
+static void   split_path(const char *full_path, char *out_dir, char *out_filename);
+static UINT32 resolve_path_to_cluster(FAT32_VOLUME *vol, const char *path);
+static int    add_dir_entry(FAT32_VOLUME *vol, UINT32 parent_cluster, const char *fat_name, UINT8 attr, UINT32 first_cluster, UINT32 file_size);
+
+static inline unsigned char inb_cmos_fat(unsigned short port) {
+    unsigned char res;
+    __asm__ volatile("inb %1, %0" : "=a"(res) : "Nd"(port));
+    return res;
+}
+
+static inline void outb_cmos_fat(unsigned short port, unsigned char val) {
+    __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static void get_fat_datetime(UINT16 *out_date, UINT16 *out_time) {
+    outb_cmos_fat(0x70, 0x00); unsigned char s = inb_cmos_fat(0x71);
+    outb_cmos_fat(0x70, 0x02); unsigned char m = inb_cmos_fat(0x71);
+    outb_cmos_fat(0x70, 0x04); unsigned char h = inb_cmos_fat(0x71);
+    outb_cmos_fat(0x70, 0x07); unsigned char day = inb_cmos_fat(0x71);
+    outb_cmos_fat(0x70, 0x08); unsigned char mon = inb_cmos_fat(0x71);
+    outb_cmos_fat(0x70, 0x09); unsigned char yr = inb_cmos_fat(0x71);
+
+    int sec_val = (s & 0x0F) + ((s >> 4) * 10);
+    int min_val = (m & 0x0F) + ((m >> 4) * 10);
+    int hr_val  = (h & 0x0F) + ((h >> 4) * 10);
+    int d_val   = (day & 0x0F) + ((day >> 4) * 10);
+    int mo_val  = (mon & 0x0F) + ((mon >> 4) * 10);
+    int y_val   = (yr & 0x0F) + ((yr >> 4) * 10) + 2000;
+
+    if (y_val < 1980) y_val = 1980;
+    if (mo_val < 1) mo_val = 1;
+    if (d_val < 1) d_val = 1;
+
+    if (out_date) {
+        *out_date = (UINT16)(((y_val - 1980) << 9) | ((mo_val & 0x0F) << 5) | (d_val & 0x1F));
+    }
+    if (out_time) {
+        *out_time = (UINT16)(((hr_val & 0x1F) << 11) | ((min_val & 0x3F) << 5) | ((sec_val / 2) & 0x1F));
+    }
+}
+
+static inline int kstrcmp(const char *s1, const char *s2) {
+    if (!s1 || !s2) return -1;
+    while (*s1 && (*s1 == *s2)) { s1++; s2++; }
+    return *(const unsigned char*)s1 - *(const unsigned char*)s2;
+}
+
+static inline int kstrcasecmp(const char *s1, const char *s2) {
+    if (!s1 || !s2) return -1;
+    while (*s1 && *s2) {
+        char c1 = *s1;
+        char c2 = *s2;
+        if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+        if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+        if (c1 != c2) return (int)(unsigned char)c1 - (int)(unsigned char)c2;
+        s1++; s2++;
+    }
+    return (int)(unsigned char)*s1 - (int)(unsigned char)*s2;
+}
+
+static UINT32 read_u32_le(const UINT8 *p) {
+    return ((UINT32)p[0]) |
+           ((UINT32)p[1] << 8) |
+           ((UINT32)p[2] << 16) |
+           ((UINT32)p[3] << 24);
+}
+
+static void write_u32_le(UINT8 *p, UINT32 value) {
+    p[0] = (UINT8)(value & 0xFF);
+    p[1] = (UINT8)((value >> 8) & 0xFF);
+    p[2] = (UINT8)((value >> 16) & 0xFF);
+    p[3] = (UINT8)((value >> 24) & 0xFF);
+}
+
+static FAT32_VOLUME* get_volume(void *port) {
+    if (!port) return NULL;
+    for (int i = 0; i < MAX_VOLUMES; i++) {
+        if (g_volumes[i].port == port && g_volumes[i].initialized) {
+            return &g_volumes[i];
+        }
+    }
+    for (int i = 0; i < MAX_VOLUMES; i++) {
+        if (g_volumes[i].port == port || g_volumes[i].port == NULL) {
+            g_volumes[i].port = port;
+            if (fat32_init(port)) return &g_volumes[i];
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+static UINT32 cluster_to_lba(FAT32_VOLUME *vol, UINT32 cluster) {
+    if (cluster < 2 || cluster >= vol->total_clusters + 2) return 0;
+    return vol->first_data_sector + (cluster - 2U) * (UINT32)vol->bpb.sectors_per_cluster;
+}
+
+static int valid_cluster(FAT32_VOLUME *vol, UINT32 cluster) {
+    return cluster >= 2 && cluster < vol->total_clusters + 2;
+}
+
+static int is_eoc(UINT32 cluster) {
+    return cluster >= FAT_EOC;
+}
+
+static UINT32 fat_sector_for_cluster(FAT32_VOLUME *vol, UINT32 cluster) {
+    return vol->lba_offset + vol->bpb.reserved_sector_count + ((cluster * 4U) / vol->bpb.bytes_per_sector);
+}
+
+static UINT32 fat_offset_in_sector(FAT32_VOLUME *vol, UINT32 cluster) {
+    return (cluster * 4U) % vol->bpb.bytes_per_sector;
+}
+
+static void to_fat_name(const char *filename, char *fat_name) {
+    for (int i = 0; i < 11; i++) fat_name[i] = ' ';
+    if (!filename) return;
+
+    if (filename[0] == '.' && filename[1] == '\0') {
+        fat_name[0] = '.';
+        return;
+    }
+    if (filename[0] == '.' && filename[1] == '.' && filename[2] == '\0') {
+        fat_name[0] = '.'; fat_name[1] = '.';
+        return;
+    }
+
+    int i = 0, j = 0, in_ext = 0;
+    while (filename[i] && j < 11) {
+        char ch = filename[i++];
+        if (ch >= 'a' && ch <= 'z') ch -= 32;
+        if (ch == '.') { in_ext = 1; j = 8; continue; }
+
+        if (!in_ext && j < 8) fat_name[j++] = ch;
+        else if (in_ext && j >= 8 && j < 11) fat_name[j++] = ch;
+    }
+}
+
+static void fat_name_to_string(const UINT8 *fat_name, char *out, int is_dir) {
+    int pos = 0;
+    for (int i = 0; i < 8; i++) {
+        if (fat_name[i] != ' ') out[pos++] = (char)fat_name[i];
+    }
+    if (fat_name[8] != ' ') {
+        if (!is_dir) out[pos++] = '.';
+        for (int i = 8; i < 11; i++) {
+            if (fat_name[i] != ' ') out[pos++] = (char)fat_name[i];
+        }
+    }
+    out[pos] = '\0';
+}
+
+static inline int fat_names_match(const UINT8 *fat_name1, const char *fat_name2) {
+    for (int i = 0; i < 11; i++) {
+        if (fat_name1[i] != (UINT8)fat_name2[i]) return 0;
+    }
+    return 1;
+}
+
+static int is_regular_entry(const FAT32_DIR_ENTRY *entry) {
+    if (entry->name[0] == 0x00 || entry->name[0] == 0xE5) return 0;
+    if (entry->attr == 0x0F || (entry->attr & 0x08)) return 0;
+    return 1;
+}
+
+static UINT8 calc_lfn_checksum(const UINT8 *short_name) {
+    UINT8 sum = 0;
+    for (int i = 0; i < 11; i++) {
+        sum = (UINT8)(((sum & 1) ? 0x80 : 0) + (sum >> 1) + short_name[i]);
+    }
+    return sum;
+}
+
+static void lfn_process_entry(const FAT32_LFN_ENTRY *lfn, char *lfn_buf, int *has_lfn, UINT8 *lfn_csum) {
+    if (!lfn || !lfn_buf || !has_lfn) return;
+
+    if (lfn->order & 0x40) {
+        __builtin_memset(lfn_buf, 0, 256);
+        if (lfn_csum) *lfn_csum = lfn->checksum;
+    }
+
+    int seq = (lfn->order & 0x1F) - 1;
+    if (seq < 0 || seq >= 19) return;
+
+    int base = seq * 13;
+    int end_found = 0;
+
+    for (int k = 0; k < 5; k++) {
+        UINT16 wc = lfn->name1[k];
+        if (wc == 0x0000 || wc == 0xFFFF) {
+            if (base + k < 255) lfn_buf[base + k] = '\0';
+            end_found = 1;
+            break;
+        }
+        if (base + k < 255) lfn_buf[base + k] = (char)(wc & 0xFF);
+    }
+
+    if (!end_found) {
+        for (int k = 0; k < 6; k++) {
+            UINT16 wc = lfn->name2[k];
+            if (wc == 0x0000 || wc == 0xFFFF) {
+                if (base + 5 + k < 255) lfn_buf[base + 5 + k] = '\0';
+                end_found = 1;
+                break;
+            }
+            if (base + 5 + k < 255) lfn_buf[base + 5 + k] = (char)(wc & 0xFF);
+        }
+    }
+
+    if (!end_found) {
+        for (int k = 0; k < 2; k++) {
+            UINT16 wc = lfn->name3[k];
+            if (wc == 0x0000 || wc == 0xFFFF) {
+                if (base + 11 + k < 255) lfn_buf[base + 11 + k] = '\0';
+                end_found = 1;
+                break;
+            }
+            if (base + 11 + k < 255) lfn_buf[base + 11 + k] = (char)(wc & 0xFF);
+        }
+    }
+
+    *has_lfn = 1;
+}
+
+static void split_path(const char *full_path, char *out_dir, char *out_filename) {
+    out_dir[0] = '/'; out_dir[1] = '\0';
+    out_filename[0] = '\0';
+    if (!full_path || !full_path[0]) return;
+
+    const char *p = full_path;
+    if (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':') p += 2;
+
+    char clean[256];
+    int len = 0;
+    while (p[len] && len < 254) {
+        clean[len] = (p[len] == '\\') ? '/' : p[len];
+        len++;
+    }
+    clean[len] = '\0';
+    while (len > 1 && clean[len - 1] == '/') clean[--len] = '\0';
+
+    const char *last_slash = 0;
+    for (int i = 0; clean[i]; i++) {
+        if (clean[i] == '/') last_slash = &clean[i];
+    }
+
+    if (last_slash) {
+        int dlen = (int)(last_slash - clean);
+        if (dlen == 0) {
+            out_dir[0] = '/'; out_dir[1] = '\0';
+        } else {
+            if (dlen > 127) dlen = 127;
+            for (int k = 0; k < dlen; k++) out_dir[k] = clean[k];
+            out_dir[dlen] = '\0';
+        }
+        const char *src = last_slash + 1;
+        int k = 0; while (src[k] && k < 63) { out_filename[k] = src[k]; k++; } out_filename[k] = '\0';
+    } else {
+        out_dir[0] = '/'; out_dir[1] = '\0';
+        int k = 0; while (clean[k] && k < 63) { out_filename[k] = clean[k]; k++; } out_filename[k] = '\0';
+    }
+}
+
+static UINT32 get_next_cluster(FAT32_VOLUME *vol, UINT32 cluster) {
+    UINT8 fat_buf[512] __attribute__((aligned(16)));
+    if (!vol || !vol->initialized || !valid_cluster(vol, cluster)) return FAT_EOC;
+
+    UINT32 fat_sector = fat_sector_for_cluster(vol, cluster);
+    UINT32 ent_offset = fat_offset_in_sector(vol, cluster);
+    if (!read_sata_sector(vol->port, fat_sector, 0, 1, fat_buf)) return FAT_BAD;
+    return read_u32_le(&fat_buf[ent_offset]) & 0x0FFFFFFFU;
+}
+
+static int set_next_cluster(FAT32_VOLUME *vol, UINT32 cluster, UINT32 value) {
+    UINT8 fat_buf[512] __attribute__((aligned(16)));
+    if (!vol || !vol->initialized || !valid_cluster(vol, cluster)) return 0;
+
+    UINT32 fat_sector = fat_sector_for_cluster(vol, cluster);
+    UINT32 ent_offset = fat_offset_in_sector(vol, cluster);
+
+    for (UINT32 i = 0; i < vol->bpb.num_fats; i++) {
+        UINT32 target = fat_sector + i * vol->bpb.table_size_32;
+        if (!read_sata_sector(vol->port, target, 0, 1, fat_buf)) return 0;
+        UINT32 old_val = read_u32_le(&fat_buf[ent_offset]);
+        write_u32_le(&fat_buf[ent_offset], (old_val & 0xF0000000U) | (value & 0x0FFFFFFFU));
+        if (!write_sata_sector(vol->port, target, 0, 1, fat_buf)) return 0;
+    }
+    vol->cached_free_bytes = 0;
+    return 1;
+}
+
+static UINT32 find_free_cluster(FAT32_VOLUME *vol) {
+    UINT8 fat_buf[512] __attribute__((aligned(16)));
+    UINT32 fat_sector = 0xFFFFFFFFU;
+    if (!vol || !vol->initialized) return 0;
+
+    UINT32 start_c = vol->last_free_cluster_hint;
+    if (!valid_cluster(vol, start_c)) start_c = 2;
+
+    for (UINT32 c = start_c; c < vol->total_clusters + 2U; c++) {
+        UINT32 cur_sec = fat_sector_for_cluster(vol, c);
+        UINT32 ent_off = fat_offset_in_sector(vol, c);
+
+        if (cur_sec != fat_sector) {
+            fat_sector = cur_sec;
+            if (!read_sata_sector(vol->port, fat_sector, 0, 1, fat_buf)) return 0;
+        }
+
+        if ((read_u32_le(&fat_buf[ent_off]) & 0x0FFFFFFFU) == FAT_FREE) {
+            vol->last_free_cluster_hint = c + 1;
+            return c;
+        }
+    }
+
+    fat_sector = 0xFFFFFFFFU;
+    for (UINT32 c = 2; c < start_c; c++) {
+        UINT32 cur_sec = fat_sector_for_cluster(vol, c);
+        UINT32 ent_off = fat_offset_in_sector(vol, c);
+
+        if (cur_sec != fat_sector) {
+            fat_sector = cur_sec;
+            if (!read_sata_sector(vol->port, fat_sector, 0, 1, fat_buf)) return 0;
+        }
+
+        if ((read_u32_le(&fat_buf[ent_off]) & 0x0FFFFFFFU) == FAT_FREE) {
+            vol->last_free_cluster_hint = c + 1;
+            return c;
+        }
+    }
+    return 0;
+}
+
+static UINT32 resolve_path_to_cluster(FAT32_VOLUME *vol, const char *path) {
+    if (!path || path[0] == '\0' || !kstrcmp(path, "/") || !kstrcmp(path, "C:") || !kstrcmp(path, "C:/") || !kstrcmp(path, "D:") || !kstrcmp(path, "D:/")) {
+        return vol->bpb.root_cluster;
+    }
+
+    UINT32 current_cluster = vol->bpb.root_cluster;
+    const char *p = path;
+    if (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':') p += 2;
+    if (*p == '/' || *p == '\\') p++;
+
+    char part[64];
+    while (*p) {
+        int len = 0;
+        while (*p && *p != '/' && *p != '\\' && len < 63) part[len++] = *p++;
+        part[len] = '\0';
+        while (*p == '/' || *p == '\\') p++;
+        if (len == 0) continue;
+
+        char target_fat[11];
+        to_fat_name(part, target_fat);
+
+        UINT8 sector_buf[512] __attribute__((aligned(16)));
+        UINT32 cluster = current_cluster;
+        int found = 0;
+
+        char lfn_buf[256];
+        __builtin_memset(lfn_buf, 0, sizeof(lfn_buf));
+        int has_lfn = 0;
+        UINT8 lfn_csum = 0;
+
+        while (valid_cluster(vol, cluster) && !is_eoc(cluster)) {
+            UINT32 lba = cluster_to_lba(vol, cluster);
+            if (lba == 0) break;
+
+            for (UINT32 s = 0; s < vol->bpb.sectors_per_cluster; s++) {
+                if (!read_sata_sector(vol->port, lba + s, 0, 1, sector_buf)) return 0;
+                FAT32_DIR_ENTRY *dir = (FAT32_DIR_ENTRY *)sector_buf;
+
+                for (int e = 0; e < 16; e++) {
+                    if (dir[e].name[0] == 0x00) break;
+                    if (dir[e].name[0] == 0xE5) { has_lfn = 0; lfn_buf[0] = '\0'; continue; }
+
+                    if (dir[e].attr == 0x0F) {
+                        lfn_process_entry((FAT32_LFN_ENTRY *)&dir[e], lfn_buf, &has_lfn, &lfn_csum);
+                        continue;
+                    }
+
+                    if (!is_regular_entry(&dir[e])) { has_lfn = 0; lfn_buf[0] = '\0'; continue; }
+
+                    int matches = 0;
+                    if (has_lfn && lfn_buf[0] && (calc_lfn_checksum(dir[e].name) == lfn_csum)) {
+                        if (!kstrcasecmp(part, lfn_buf)) matches = 1;
+                    }
+                    if (!matches && fat_names_match(dir[e].name, target_fat)) matches = 1;
+
+                    if (matches && (dir[e].attr & 0x10)) {
+                        current_cluster = ((UINT32)dir[e].first_cluster_high << 16) | dir[e].first_cluster_low;
+                        if (current_cluster == 0) current_cluster = vol->bpb.root_cluster;
+                        found = 1;
+                        break;
+                    }
+                    has_lfn = 0;
+                    lfn_buf[0] = '\0';
+                }
+                if (found) break;
+            }
+            if (found) break;
+            cluster = get_next_cluster(vol, cluster);
+        }
+        if (!found) return 0;
+    }
+    return current_cluster;
+}
+
+static int add_dir_entry(FAT32_VOLUME *vol, UINT32 parent_cluster, const char *fat_name, UINT8 attr, UINT32 first_cluster, UINT32 file_size) {
+    UINT8 sector_buf[512] __attribute__((aligned(16)));
+    UINT32 cluster = parent_cluster;
+    UINT32 last_cluster = parent_cluster;
+
+    UINT16 cur_d = 0, cur_t = 0;
+    get_fat_datetime(&cur_d, &cur_t);
+
+    while (valid_cluster(vol, cluster) && !is_eoc(cluster)) {
+        last_cluster = cluster;
+        UINT32 lba = cluster_to_lba(vol, cluster);
+        for (UINT32 s = 0; s < vol->bpb.sectors_per_cluster; s++) {
+            if (!read_sata_sector(vol->port, lba + s, 0, 1, sector_buf)) return 0;
+            FAT32_DIR_ENTRY *dir = (FAT32_DIR_ENTRY *)sector_buf;
+
+            for (int e = 0; e < 16; e++) {
+                if (dir[e].name[0] == 0x00 || dir[e].name[0] == 0xE5) {
+                    __builtin_memcpy(dir[e].name, fat_name, 11);
+                    dir[e].attr = attr;
+                    dir[e].nt_res = 0;
+                    dir[e].file_size = file_size;
+                    dir[e].wrt_date = cur_d;
+                    dir[e].wrt_time = cur_t;
+                    dir[e].crt_date = cur_d;
+                    dir[e].crt_time = cur_t;
+                    dir[e].first_cluster_high = (UINT16)(first_cluster >> 16);
+                    dir[e].first_cluster_low = (UINT16)(first_cluster & 0xFFFF);
+                    vol->cached_free_bytes = 0;
+                    return write_sata_sector(vol->port, lba + s, 0, 1, sector_buf);
+                }
+            }
+        }
+        cluster = get_next_cluster(vol, cluster);
+    }
+
+    UINT32 new_dir_c = find_free_cluster(vol);
+    if (!valid_cluster(vol, new_dir_c)) return 0;
+    set_next_cluster(vol, new_dir_c, FAT_EOC);
+    set_next_cluster(vol, last_cluster, new_dir_c);
+
+    UINT32 new_lba = cluster_to_lba(vol, new_dir_c);
+    __builtin_memset(sector_buf, 0, sizeof(sector_buf));
+    FAT32_DIR_ENTRY *dir = (FAT32_DIR_ENTRY *)sector_buf;
+    __builtin_memcpy(dir[0].name, fat_name, 11);
+    dir[0].attr = attr;
+    dir[0].nt_res = 0;
+    dir[0].file_size = file_size;
+    dir[0].wrt_date = cur_d;
+    dir[0].wrt_time = cur_t;
+    dir[0].crt_date = cur_d;
+    dir[0].crt_time = cur_t;
+    dir[0].first_cluster_high = (UINT16)(first_cluster >> 16);
+    dir[0].first_cluster_low = (UINT16)(first_cluster & 0xFFFF);
+
+    write_sata_sector(vol->port, new_lba, 0, 1, sector_buf);
+    __builtin_memset(sector_buf, 0, sizeof(sector_buf));
+    for (UINT32 s = 1; s < vol->bpb.sectors_per_cluster; s++) {
+        write_sata_sector(vol->port, new_lba + s, 0, 1, sector_buf);
+    }
+    vol->cached_free_bytes = 0;
+    return 1;
+}
+
+int fat32_format(void *ahci_port, UINT64 total_sectors) {
+    if (!ahci_port || total_sectors < 65536) return 0;
+
+    for (int i = 0; i < MAX_VOLUMES; i++) {
+        if (g_volumes[i].port == ahci_port) {
+            g_volumes[i].initialized = 0;
+            g_volumes[i].port = NULL;
+        }
+    }
+
+    UINT8 sector_buf[512] __attribute__((aligned(16)));
+    __builtin_memset(sector_buf, 0, 512);
+
+    UINT32 part_lba = 2048;
+    UINT32 part_sectors = (total_sectors > 2048) ? (UINT32)(total_sectors - 2048) : (UINT32)total_sectors;
+
+    UINT8 *mbr_part = &sector_buf[446];
+    mbr_part[0] = 0x80;
+    mbr_part[4] = 0xEF;
+    write_u32_le(&mbr_part[8], part_lba);
+    write_u32_le(&mbr_part[12], part_sectors);
+    sector_buf[510] = 0x55;
+    sector_buf[511] = 0xAA;
+    write_sata_sector(ahci_port, 0, 0, 1, sector_buf);
+
+    __builtin_memset(sector_buf, 0, 512);
+    FAT32_BPB *bpb = (FAT32_BPB *)sector_buf;
+    bpb->jump_boot[0] = 0xEB; bpb->jump_boot[1] = 0x58; bpb->jump_boot[2] = 0x90;
+    __builtin_memcpy(bpb->oem_name, "MSWIN4.1", 8);
+    bpb->bytes_per_sector = 512;
+    bpb->sectors_per_cluster = (part_sectors > 67108864ULL) ? 64 : ((part_sectors > 16777216ULL) ? 32 : 8);
+    bpb->reserved_sector_count = 32;
+    bpb->num_fats = 2;
+    bpb->media = 0xF8;
+    bpb->sectors_per_track = 63;
+    bpb->head_count = 255;
+    bpb->hidden_sectors = part_lba;
+    bpb->total_sectors_32 = part_sectors;
+
+    UINT32 data_sec = bpb->total_sectors_32 - bpb->reserved_sector_count;
+    UINT32 fat_sz = ((data_sec / bpb->sectors_per_cluster) * 4 + 511) / 512;
+    bpb->table_size_32 = fat_sz;
+    bpb->root_cluster = 2;
+    bpb->fs_info = 1;
+    bpb->backup_boot_sector = 6;
+    bpb->boot_signature = 0x29;
+    bpb->volume_id = 0x12345678;
+    __builtin_memcpy(bpb->volume_label, "VELO_DISK  ", 11);
+    __builtin_memcpy(bpb->fs_type, "FAT32   ", 8);
+    sector_buf[510] = 0x55; sector_buf[511] = 0xAA;
+
+    write_sata_sector(ahci_port, part_lba, 0, 1, sector_buf);
+
+    __builtin_memset(sector_buf, 0, 512);
+    sector_buf[0] = 0x52; sector_buf[1] = 0x52; sector_buf[2] = 0x61; sector_buf[3] = 0x41;
+    sector_buf[484] = 0x72; sector_buf[485] = 0x72; sector_buf[486] = 0x41; sector_buf[487] = 0x61;
+    write_u32_le(&sector_buf[488], (data_sec / bpb->sectors_per_cluster) - 1);
+    write_u32_le(&sector_buf[492], 3);
+    sector_buf[510] = 0x55; sector_buf[511] = 0xAA;
+    write_sata_sector(ahci_port, part_lba + 1, 0, 1, sector_buf);
+
+    __builtin_memset(sector_buf, 0, 512);
+    write_u32_le(&sector_buf[0], 0x0FFFFFF8);
+    write_u32_le(&sector_buf[4], 0x0FFFFFFF);
+    write_u32_le(&sector_buf[8], 0x0FFFFFFF);
+
+    write_sata_sector(ahci_port, part_lba + bpb->reserved_sector_count, 0, 1, sector_buf);
+    write_sata_sector(ahci_port, part_lba + bpb->reserved_sector_count + fat_sz, 0, 1, sector_buf);
+
+    UINT32 root_lba = part_lba + bpb->reserved_sector_count + (bpb->num_fats * fat_sz);
+    __builtin_memset(sector_buf, 0, 512);
+    for (UINT32 s = 0; s < bpb->sectors_per_cluster; s++) {
+        write_sata_sector(ahci_port, root_lba + s, 0, 1, sector_buf);
+    }
+
+    return fat32_init(ahci_port);
+}
+
+int fat32_init(void *ahci_port) {
+    if (!ahci_port) return 0;
+    UINT8 sector_buf[512] __attribute__((aligned(16)));
+
+    int slot = -1;
+    for (int i = 0; i < MAX_VOLUMES; i++) {
+        if (g_volumes[i].port == ahci_port) { slot = i; break; }
+    }
+    if (slot == -1) {
+        for (int i = 0; i < MAX_VOLUMES; i++) {
+            if (g_volumes[i].port == NULL) { slot = i; break; }
+        }
+    }
+    if (slot == -1) slot = 0;
+
+    FAT32_VOLUME *vol = &g_volumes[slot];
+    vol->port = ahci_port;
+    vol->lba_offset = 0;
+    vol->initialized = 0;
+    vol->cached_free_bytes = 0;
+    vol->last_free_cluster_hint = 2;
+
+    if (!read_sata_sector(vol->port, 0, 0, 1, sector_buf)) return 0;
+
+    if ((sector_buf[0] != 0xEB && sector_buf[0] != 0xE9) && sector_buf[510] == 0x55 && sector_buf[511] == 0xAA) {
+        UINT8 *part1 = &sector_buf[446];
+        UINT32 part_lba = read_u32_le(&part1[8]);
+        if (part_lba > 0 && part_lba < 100000000) {
+            vol->lba_offset = part_lba;
+            if (!read_sata_sector(vol->port, vol->lba_offset, 0, 1, sector_buf)) return 0;
+        }
+    }
+
+    __builtin_memcpy(&vol->bpb, sector_buf, sizeof(FAT32_BPB));
+
+    if (vol->bpb.bytes_per_sector != 512 || vol->bpb.sectors_per_cluster == 0) return 0;
+    if (vol->bpb.reserved_sector_count == 0 || vol->bpb.num_fats == 0 || vol->bpb.table_size_32 == 0) return 0;
+
+    UINT32 total_sectors = (vol->bpb.total_sectors_32 != 0) ? vol->bpb.total_sectors_32 : (UINT32)vol->bpb.total_sectors_16;
+    if (total_sectors == 0) return 0;
+
+    UINT64 fat_sectors = (UINT64)vol->bpb.num_fats * vol->bpb.table_size_32;
+    UINT64 data_start = (UINT64)vol->bpb.reserved_sector_count + fat_sectors;
+    if (data_start >= total_sectors) return 0;
+
+    vol->total_clusters = (total_sectors - (UINT32)data_start) / vol->bpb.sectors_per_cluster;
+    if (vol->total_clusters == 0) return 0;
+
+    vol->first_data_sector = vol->lba_offset + (UINT32)data_start;
+    vol->bytes_per_cluster = (UINT32)vol->bpb.sectors_per_cluster * 512U;
+    vol->initialized = 1;
+
+    return 1;
+}
+
+int fat32_mkdir(void *ahci_port, const char *path) {
+    FAT32_VOLUME *vol = get_volume(ahci_port);
+    if (!vol || !path || path[0] == '\0') return 0;
+
+    char parent_path[128], dir_name[64];
+    split_path(path, parent_path, dir_name);
+    if (dir_name[0] == '\0') return 0;
+
+    UINT32 parent_cluster = resolve_path_to_cluster(vol, parent_path);
+    if (!valid_cluster(vol, parent_cluster)) parent_cluster = vol->bpb.root_cluster;
+
+    char target_fat[11];
+    to_fat_name(dir_name, target_fat);
+
+    UINT8 sector_buf[512] __attribute__((aligned(16)));
+    UINT32 cluster = parent_cluster;
+    while (valid_cluster(vol, cluster) && !is_eoc(cluster)) {
+        UINT32 lba = cluster_to_lba(vol, cluster);
+        for (UINT32 s = 0; s < vol->bpb.sectors_per_cluster; s++) {
+            if (!read_sata_sector(vol->port, lba + s, 0, 1, sector_buf)) return 0;
+            FAT32_DIR_ENTRY *dir = (FAT32_DIR_ENTRY *)sector_buf;
+            for (int e = 0; e < 16; e++) {
+                if (dir[e].name[0] == 0x00) break;
+                if (!is_regular_entry(&dir[e])) continue;
+                if (fat_names_match(dir[e].name, target_fat) && (dir[e].attr & 0x10)) return 1;
+            }
+        }
+        cluster = get_next_cluster(vol, cluster);
+    }
+
+    UINT32 new_cluster = find_free_cluster(vol);
+    if (!valid_cluster(vol, new_cluster)) return 0;
+    if (!set_next_cluster(vol, new_cluster, FAT_EOC)) return 0;
+
+    UINT8 new_dir_sec[512] __attribute__((aligned(16)));
+    __builtin_memset(new_dir_sec, 0, sizeof(new_dir_sec));
+    FAT32_DIR_ENTRY *dots = (FAT32_DIR_ENTRY *)new_dir_sec;
+
+    UINT16 cur_d = 0, cur_t = 0;
+    get_fat_datetime(&cur_d, &cur_t);
+
+    __builtin_memcpy(dots[0].name, ".          ", 11);
+    dots[0].attr = 0x10;
+    dots[0].wrt_date = cur_d;
+    dots[0].wrt_time = cur_t;
+    dots[0].first_cluster_high = (UINT16)(new_cluster >> 16);
+    dots[0].first_cluster_low = (UINT16)(new_cluster & 0xFFFF);
+
+    __builtin_memcpy(dots[1].name, "..         ", 11);
+    dots[1].attr = 0x10;
+    dots[1].wrt_date = cur_d;
+    dots[1].wrt_time = cur_t;
+    UINT32 p_val = (parent_cluster == vol->bpb.root_cluster) ? 0 : parent_cluster;
+    dots[1].first_cluster_high = (UINT16)(p_val >> 16);
+    dots[1].first_cluster_low = (UINT16)(p_val & 0xFFFF);
+
+    UINT32 new_lba = cluster_to_lba(vol, new_cluster);
+    write_sata_sector(vol->port, new_lba, 0, 1, new_dir_sec);
+
+    __builtin_memset(new_dir_sec, 0, sizeof(new_dir_sec));
+    for (UINT32 s = 1; s < vol->bpb.sectors_per_cluster; s++) {
+        write_sata_sector(vol->port, new_lba + s, 0, 1, new_dir_sec);
+    }
+
+    return add_dir_entry(vol, parent_cluster, target_fat, 0x10, new_cluster, 0);
+}
+
+/* =========================================================================
+ * ATOMARES SCHREIBEN: FAT32_WRITE_FILE
+ * 1. Vorabprüfung auf ausreichend Speicherplatz
+ * 2. Daten schreiben VOR der FAT-Verkettung
+ * 3. FAT-Kette versiegeln
+ * 4. Directory-Eintrag finalisieren
+ * ========================================================================= */
+int fat32_write_file(void *ahci_port, const char *filename, void *buffer, UINT32 size) {
+    FAT32_VOLUME *vol = get_volume(ahci_port);
+    if (!vol || !filename) return 0;
+
+    UINT32 clusters_needed = (size + vol->bytes_per_cluster - 1) / vol->bytes_per_cluster;
+    if (clusters_needed == 0) clusters_needed = 1;
+
+    UINT64 free_bytes = fat32_get_free_bytes(ahci_port);
+    if ((UINT64)clusters_needed * vol->bytes_per_cluster > free_bytes) {
+        return 0; // Kein Speicherplatz frei
+    }
+
+    char dir_path[128], file_name[64];
+    split_path(filename, dir_path, file_name);
+
+    UINT32 parent_cluster = resolve_path_to_cluster(vol, dir_path);
+    if (!valid_cluster(vol, parent_cluster)) parent_cluster = vol->bpb.root_cluster;
+
+    char target_fat[11];
+    to_fat_name(file_name, target_fat);
+
+    UINT8 sector_buf[512] __attribute__((aligned(16)));
+    UINT32 cluster = parent_cluster;
+    int existing_found = 0;
+    UINT32 exist_lba = 0;
+    int exist_entry_idx = 0;
+    FAT32_DIR_ENTRY exist_entry_copy;
+
+    while (valid_cluster(vol, cluster) && !is_eoc(cluster)) {
+        UINT32 lba = cluster_to_lba(vol, cluster);
+        for (UINT32 s = 0; s < vol->bpb.sectors_per_cluster; s++) {
+            if (!read_sata_sector(vol->port, lba + s, 0, 1, sector_buf)) break;
+            FAT32_DIR_ENTRY *dir = (FAT32_DIR_ENTRY *)sector_buf;
+            for (int e = 0; e < 16; e++) {
+                if (dir[e].name[0] == 0x00) break;
+                if (!is_regular_entry(&dir[e])) continue;
+                if (fat_names_match(dir[e].name, target_fat) && !(dir[e].attr & 0x10)) {
+                    existing_found = 1;
+                    exist_lba = lba + s;
+                    exist_entry_idx = e;
+                    exist_entry_copy = dir[e];
+                    break;
+                }
+            }
+            if (existing_found) break;
+        }
+        if (existing_found) break;
+        cluster = get_next_cluster(vol, cluster);
+    }
+
+    #define MAX_ALLOC_CLUSTERS 4096
+    static UINT32 new_chain[MAX_ALLOC_CLUSTERS];
+    if (clusters_needed > MAX_ALLOC_CLUSTERS) return 0;
+
+    for (UINT32 i = 0; i < clusters_needed; i++) {
+        UINT32 c = find_free_cluster(vol);
+        if (!valid_cluster(vol, c)) return 0;
+        new_chain[i] = c;
+        vol->last_free_cluster_hint = c + 1;
+    }
+
+    UINT32 bytes_written = 0;
+    const UINT8 *src = (const UINT8*)buffer;
+
+    for (UINT32 i = 0; i < clusters_needed; i++) {
+        UINT32 lba = cluster_to_lba(vol, new_chain[i]);
+        for (UINT32 s = 0; s < vol->bpb.sectors_per_cluster; s++) {
+            UINT8 temp[512] __attribute__((aligned(16)));
+            __builtin_memset(temp, 0, sizeof(temp));
+
+            if (bytes_written < size) {
+                UINT32 chunk = (size - bytes_written > 512) ? 512 : (size - bytes_written);
+                __builtin_memcpy(temp, src + bytes_written, chunk);
+                bytes_written += chunk;
+            }
+            if (!write_sata_sector(vol->port, lba + s, 0, 1, temp)) return 0;
+        }
+    }
+
+    for (UINT32 i = 0; i < clusters_needed; i++) {
+        UINT32 next_val = (i + 1 < clusters_needed) ? new_chain[i + 1] : FAT_EOC;
+        set_next_cluster(vol, new_chain[i], next_val);
+    }
+
+    if (existing_found) {
+        UINT32 old_c = ((UINT32)exist_entry_copy.first_cluster_high << 16) | exist_entry_copy.first_cluster_low;
+        while (valid_cluster(vol, old_c) && !is_eoc(old_c)) {
+            UINT32 nxt = get_next_cluster(vol, old_c);
+            set_next_cluster(vol, old_c, FAT_FREE);
+            if (nxt == FAT_BAD || nxt == FAT_FREE) break;
+            old_c = nxt;
+        }
+    }
+
+    UINT16 cur_d = 0, cur_t = 0;
+    get_fat_datetime(&cur_d, &cur_t);
+
+    UINT32 first_cluster = new_chain[0];
+
+    if (existing_found) {
+        if (!read_sata_sector(vol->port, exist_lba, 0, 1, sector_buf)) return 0;
+        FAT32_DIR_ENTRY *dir = (FAT32_DIR_ENTRY *)sector_buf;
+        dir[exist_entry_idx].file_size = size;
+        dir[exist_entry_idx].first_cluster_high = (UINT16)(first_cluster >> 16);
+        dir[exist_entry_idx].first_cluster_low = (UINT16)(first_cluster & 0xFFFF);
+        dir[exist_entry_idx].wrt_date = cur_d;
+        dir[exist_entry_idx].wrt_time = cur_t;
+        vol->cached_free_bytes = 0;
+        return write_sata_sector(vol->port, exist_lba, 0, 1, sector_buf);
+    } else {
+        return add_dir_entry(vol, parent_cluster, target_fat, 0x20, first_cluster, size);
+    }
+}
+
+int fat32_rename_file(void *ahci_port, const char *old_path, const char *new_name) {
+    if (is_system_protected_path(old_path)) return 0;
+
+    FAT32_VOLUME *vol = get_volume(ahci_port);
+    if (!vol || !old_path || !new_name) return 0;
+
+    char dir_path[128], old_name[64];
+    split_path(old_path, dir_path, old_name);
+
+    const char *last_slash = 0;
+    for (int i = 0; new_name[i]; i++) {
+        if (new_name[i] == '/' || new_name[i] == '\\') last_slash = &new_name[i];
+    }
+    const char *clean_new_name = last_slash ? last_slash + 1 : new_name;
+
+    UINT32 parent_cluster = resolve_path_to_cluster(vol, dir_path);
+    if (!valid_cluster(vol, parent_cluster)) parent_cluster = vol->bpb.root_cluster;
+
+    UINT8 sector_buf[512] __attribute__((aligned(16)));
+    char old_fat[11], new_fat[11];
+    to_fat_name(old_name, old_fat);
+    to_fat_name(clean_new_name, new_fat);
+
+    UINT16 cur_d = 0, cur_t = 0;
+    get_fat_datetime(&cur_d, &cur_t);
+
+    UINT32 cluster = parent_cluster;
+    while (valid_cluster(vol, cluster) && !is_eoc(cluster)) {
+        UINT32 lba = cluster_to_lba(vol, cluster);
+        for (UINT32 s = 0; s < vol->bpb.sectors_per_cluster; s++) {
+            if (!read_sata_sector(vol->port, lba + s, 0, 1, sector_buf)) return 0;
+            FAT32_DIR_ENTRY *dir = (FAT32_DIR_ENTRY *)sector_buf;
+
+            for (int e = 0; e < 16; e++) {
+                if (dir[e].name[0] == 0x00) return 0;
+                if (!is_regular_entry(&dir[e])) continue;
+
+                if (fat_names_match(dir[e].name, old_fat)) {
+                    __builtin_memcpy(dir[e].name, new_fat, 11);
+                    dir[e].nt_res = 0;
+                    dir[e].wrt_date = cur_d;
+                    dir[e].wrt_time = cur_t;
+                    return write_sata_sector(vol->port, lba + s, 0, 1, sector_buf);
+                }
+            }
+        }
+        cluster = get_next_cluster(vol, cluster);
+    }
+    return 0;
+}
+
+int fat32_delete_file(void *ahci_port, const char *filename) {
+    if (is_system_protected_path(filename)) {
+        return 0;
+    }
+
+    FAT32_VOLUME *vol = get_volume(ahci_port);
+    if (!vol || !filename) return 0;
+
+    char dir_path[128], file_name[64];
+    split_path(filename, dir_path, file_name);
+
+    UINT32 parent_cluster = resolve_path_to_cluster(vol, dir_path);
+    if (!valid_cluster(vol, parent_cluster)) parent_cluster = vol->bpb.root_cluster;
+
+    UINT8 sector_buf[512] __attribute__((aligned(16)));
+    char target_fat[11];
+    to_fat_name(file_name, target_fat);
+
+    UINT32 cluster = parent_cluster;
+    while (valid_cluster(vol, cluster) && !is_eoc(cluster)) {
+        UINT32 lba = cluster_to_lba(vol, cluster);
+        for (UINT32 s = 0; s < vol->bpb.sectors_per_cluster; s++) {
+            if (!read_sata_sector(vol->port, lba + s, 0, 1, sector_buf)) return 0;
+            FAT32_DIR_ENTRY *dir = (FAT32_DIR_ENTRY *)sector_buf;
+
+            for (int e = 0; e < 16; e++) {
+                if (dir[e].name[0] == 0x00) return 0;
+                if (!is_regular_entry(&dir[e])) continue;
+
+                if (fat_names_match(dir[e].name, target_fat)) {
+                    UINT32 start_c = ((UINT32)dir[e].first_cluster_high << 16) | dir[e].first_cluster_low;
+                    dir[e].name[0] = 0xE5;
+                    write_sata_sector(vol->port, lba + s, 0, 1, sector_buf);
+
+                    UINT32 cur_c = start_c;
+                    while (valid_cluster(vol, cur_c) && !is_eoc(cur_c)) {
+                        UINT32 next_c = get_next_cluster(vol, cur_c);
+                        set_next_cluster(vol, cur_c, FAT_FREE);
+                        if (next_c == FAT_BAD || next_c == FAT_FREE) break;
+                        cur_c = next_c;
+                    }
+                    vol->cached_free_bytes = 0;
+                    return 1;
+                }
+            }
+        }
+        cluster = get_next_cluster(vol, cluster);
+    }
+    return 0;
+}
+
+int fat32_read_file(void *ahci_port, const char *filename, void *buffer, UINT32 max_size) {
+    FAT32_VOLUME *vol = get_volume(ahci_port);
+    if (!vol || !filename || !buffer) return -1;
+
+    char dir_path[128], file_name[64];
+    split_path(filename, dir_path, file_name);
+
+    UINT32 current_cluster = resolve_path_to_cluster(vol, dir_path);
+    if (!valid_cluster(vol, current_cluster)) return -1;
+
+    UINT8 sector_buf[512] __attribute__((aligned(16)));
+    char target_fat[11];
+    to_fat_name(file_name, target_fat);
+
+    FAT32_DIR_ENTRY entry;
+    int found = 0;
+
+    char lfn_buf[256];
+    __builtin_memset(lfn_buf, 0, sizeof(lfn_buf));
+    int has_lfn = 0;
+    UINT8 lfn_csum = 0;
+
+    while (valid_cluster(vol, current_cluster) && !is_eoc(current_cluster)) {
+        UINT32 lba = cluster_to_lba(vol, current_cluster);
+        for (UINT32 s = 0; s < vol->bpb.sectors_per_cluster; s++) {
+            if (!read_sata_sector(vol->port, lba + s, 0, 1, sector_buf)) return -1;
+            FAT32_DIR_ENTRY *dir = (FAT32_DIR_ENTRY *)sector_buf;
+
+            for (int e = 0; e < 16; e++) {
+                if (dir[e].name[0] == 0x00) return -1;
+                if (dir[e].name[0] == 0xE5) { has_lfn = 0; lfn_buf[0] = '\0'; continue; }
+
+                if (dir[e].attr == 0x0F) {
+                    lfn_process_entry((FAT32_LFN_ENTRY *)&dir[e], lfn_buf, &has_lfn, &lfn_csum);
+                    continue;
+                }
+
+                if (!is_regular_entry(&dir[e])) { has_lfn = 0; lfn_buf[0] = '\0'; continue; }
+
+                int matches = 0;
+                if (has_lfn && lfn_buf[0] && (calc_lfn_checksum(dir[e].name) == lfn_csum)) {
+                    if (!kstrcasecmp(file_name, lfn_buf)) matches = 1;
+                }
+                if (!matches && fat_names_match(dir[e].name, target_fat)) matches = 1;
+
+                if (matches) {
+                    entry = dir[e];
+                    found = 1;
+                    break;
+                }
+                has_lfn = 0;
+                lfn_buf[0] = '\0';
+            }
+            if (found) break;
+        }
+        if (found) break;
+        current_cluster = get_next_cluster(vol, current_cluster);
+    }
+
+    if (!found) return -1;
+
+    UINT32 file_size = entry.file_size;
+    UINT32 bytes_to_read = file_size < max_size ? file_size : max_size;
+    UINT32 file_cluster = ((UINT32)entry.first_cluster_high << 16) | entry.first_cluster_low;
+    if (file_cluster < 2) return 0;
+
+    UINT8 *dest = (UINT8 *)buffer;
+    UINT32 bytes_read = 0;
+
+    while (bytes_read < bytes_to_read && valid_cluster(vol, file_cluster)) {
+        UINT32 lba = cluster_to_lba(vol, file_cluster);
+        for (UINT32 s = 0; s < vol->bpb.sectors_per_cluster; s++) {
+            if (!read_sata_sector(vol->port, lba + s, 0, 1, sector_buf)) return -1;
+            UINT32 rem = bytes_to_read - bytes_read;
+            UINT32 chunk = rem > 512 ? 512 : rem;
+            __builtin_memcpy(dest + bytes_read, sector_buf, chunk);
+            bytes_read += chunk;
+            if (bytes_read >= bytes_to_read) break;
+        }
+        if (bytes_read >= bytes_to_read) break;
+        file_cluster = get_next_cluster(vol, file_cluster);
+    }
+    return (int)bytes_read;
+}
+
+int fat32_copy_file(void *ahci_port, const char *src_path, const char *dst_path) {
+    return fat32_copy_cross_port(ahci_port, src_path, ahci_port, dst_path);
+}
+
+int fat32_move_file(void *ahci_port, const char *src_path, const char *dst_path) {
+    if (!ahci_port || !src_path || !dst_path) return 0;
+    if (!kstrcmp(src_path, dst_path)) return 1;
+
+    char src_dir[128], src_file[64];
+    char dst_dir[128], dst_file[64];
+    split_path(src_path, src_dir, src_file);
+    split_path(dst_path, dst_dir, dst_file);
+
+    if (!kstrcmp(src_dir, dst_dir)) {
+        return fat32_rename_file(ahci_port, src_path, dst_file);
+    }
+
+    int bytes = fat32_read_file(ahci_port, src_path, g_fat32_io_buf, sizeof(g_fat32_io_buf));
+    if (bytes < 0) return 0;
+
+    fat32_delete_file(ahci_port, dst_path);
+    if (!fat32_write_file(ahci_port, dst_path, g_fat32_io_buf, (UINT32)bytes)) return 0;
+    return fat32_delete_file(ahci_port, src_path);
+}
+
+int fat32_copy_cross_port(void *src_port, const char *src_path, void *dst_port, const char *dst_path) {
+    if (!src_port || !dst_port || !src_path || !dst_path) return 0;
+    int bytes = fat32_read_file(src_port, src_path, g_fat32_io_buf, sizeof(g_fat32_io_buf));
+    if (bytes <= 0) return 0;
+    fat32_delete_file(dst_port, dst_path);
+    return fat32_write_file(dst_port, dst_path, g_fat32_io_buf, (UINT32)bytes);
+}
+
+int fat32_list_dir(void *ahci_port, const char *path, VeloDirEntry *out_entries, int max_entries) {
+    FAT32_VOLUME *vol = get_volume(ahci_port);
+    if (!vol || !out_entries || max_entries <= 0) return 0;
+
+    UINT32 current_cluster = resolve_path_to_cluster(vol, path);
+    if (!valid_cluster(vol, current_cluster)) return 0;
+
+    UINT8 sector_buf[512] __attribute__((aligned(16)));
+    int found_count = 0;
+    UINT32 guard = 0;
+
+    char lfn_buf[256];
+    __builtin_memset(lfn_buf, 0, sizeof(lfn_buf));
+    int has_lfn = 0;
+    UINT8 lfn_csum = 0;
+
+    while (valid_cluster(vol, current_cluster) && !is_eoc(current_cluster) && found_count < max_entries) {
+        if (++guard > 2048) break;
+
+        UINT32 lba = cluster_to_lba(vol, current_cluster);
+        if (lba == 0) break;
+
+        for (UINT32 s = 0; s < vol->bpb.sectors_per_cluster && found_count < max_entries; s++) {
+            if (!read_sata_sector(vol->port, lba + s, 0, 1, sector_buf)) return found_count;
+
+            FAT32_DIR_ENTRY *dir = (FAT32_DIR_ENTRY *)sector_buf;
+            for (UINT32 e = 0; e < 16 && found_count < max_entries; e++) {
+                if (dir[e].name[0] == 0x00) return found_count;
+                if (dir[e].name[0] == 0xE5) { has_lfn = 0; lfn_buf[0] = '\0'; continue; }
+
+                if (dir[e].attr == 0x0F) {
+                    lfn_process_entry((FAT32_LFN_ENTRY *)&dir[e], lfn_buf, &has_lfn, &lfn_csum);
+                    continue;
+                }
+
+                if (!is_regular_entry(&dir[e])) { has_lfn = 0; lfn_buf[0] = '\0'; continue; }
+                if (dir[e].name[0] == '.') { has_lfn = 0; lfn_buf[0] = '\0'; continue; }
+
+                VeloDirEntry *out = &out_entries[found_count];
+                out->is_dir = (dir[e].attr & 0x10) ? 1 : 0;
+                out->attr = dir[e].attr;
+                out->size = dir[e].file_size;
+                out->date = dir[e].wrt_date;
+                out->time = dir[e].wrt_time;
+
+                if (has_lfn && lfn_buf[0] != '\0' && (calc_lfn_checksum(dir[e].name) == lfn_csum)) {
+                    int lp = 0;
+                    while (lfn_buf[lp] && lp < 31) {
+                        out->name[lp] = lfn_buf[lp];
+                        lp++;
+                    }
+                    out->name[lp] = '\0';
+                } else {
+                    fat_name_to_string(dir[e].name, out->name, out->is_dir);
+                }
+
+                has_lfn = 0;
+                lfn_buf[0] = '\0';
+                found_count++;
+            }
+        }
+
+        UINT32 next = get_next_cluster(vol, current_cluster);
+        if (is_eoc(next) || !valid_cluster(vol, next)) break;
+        current_cluster = next;
+    }
+    return found_count;
+}
+
+int fat32_list_root(void *ahci_port, char out_files[][32], int max_files) {
+    VeloDirEntry entries[32];
+    int count = fat32_list_dir(ahci_port, "/", entries, max_files);
+    for (int i = 0; i < count; i++) {
+        __builtin_memcpy(out_files[i], entries[i].name, 32);
+    }
+    return count;
+}
+
+UINT64 fat32_get_free_bytes(void *ahci_port) {
+    FAT32_VOLUME *vol = get_volume(ahci_port);
+    if (!vol || !vol->initialized) {
+        for (int i = 0; i < ahci_get_port_count(); i++) {
+            AHCI_PORT_INFO *info = ahci_get_port_info(i);
+            if (info && info->port_addr == ahci_port) {
+                return (UINT64)info->sector_count * 512ULL;
+            }
+        }
+        return 0;
+    }
+    if (vol->cached_free_bytes > 0) return vol->cached_free_bytes;
+
+    vol->cached_free_bytes = (UINT64)(vol->total_clusters - 2) * (UINT64)vol->bytes_per_cluster;
+    return vol->cached_free_bytes;
+}
+
+int is_system_protected_path(const char *path) {
+    if (!path || !path[0]) return 1;
+
+    const char *p = path;
+    if (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':') p += 2;
+    while (*p == '/' || *p == '\\') p++;
+
+    if (!*p) return 1;
+
+    if (!kstrcasecmp(p, "EFI") || !kstrcasecmp(p, "EFI/BOOT") || !kstrcasecmp(p, "EFI/BOOT/BOOTX64.EFI") ||
+        !kstrcasecmp(p, "VeloOS") || !kstrcasecmp(p, "VeloOS/System32") || !kstrcasecmp(p, "VeloOS/System32/CONFIG.DAT") ||
+        !kstrcasecmp(p, "CONFIG.DAT") || !kstrcasecmp(p, "BOOTX64.EFI") ||
+        !kstrcasecmp(p, "bin") || !kstrcasecmp(p, "Programs") || !kstrcasecmp(p, "Program Files") ||
+        !kstrcasecmp(p, "Users") || !kstrcasecmp(p, "Users/Desktop") ||
+        !kstrcasecmp(p, "Users/Documents") || !kstrcasecmp(p, "Users/Downloads") ||
+        !kstrcasecmp(p, "Users/Pictures")) {
+        return 1;
+    }
+
+    return 0;
+}
