@@ -59,7 +59,7 @@ To build and run VeloOS v12.3.0 from source:
 2. Run the main build target from the root directory:
    ```bash
    make clean
-   make all
+   make run
    ```
 3. Test the image using QEMU with UEFI firmware (EDK2):
    ```bash
