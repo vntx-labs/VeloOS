@@ -23,9 +23,9 @@ typedef struct {
 } MouseState;
 
 void mouse_init(void);
-int mouse_update(void);
+int  mouse_update(void);
 MouseState* mouse_get_state(void);
 void mouse_set_cursor(int cursor_type);
 void mouse_draw_cursor(void);
 
-#endif
+#endif /* MOUSE_H */

@@ -122,36 +122,48 @@ int velo_ui_textbox_handle_key(char *text, int max_len, int *cursor_pos, char ke
     if (pos > len) pos = len;
     if (pos < 0) pos = 0;
 
-    if (key == (char)0x84) {
-        if (pos > 0) *cursor_pos = pos - 1;
-        return 1;
-    } else if (key == (char)0x85) {
-        if (pos < len) *cursor_pos = pos + 1;
-        return 1;
-    } else if (key == (char)0x86) {
+    if (key == KEY_LEFT || key == (char)0x84) {
+        if (pos > 0) { *cursor_pos = pos - 1; return 1; }
+        return 0;
+    } else if (key == KEY_RIGHT || key == (char)0x85) {
+        if (pos < len) { *cursor_pos = pos + 1; return 1; }
+        return 0;
+    } else if (key == KEY_HOME || key == (char)0x86) {
         *cursor_pos = 0;
         return 1;
-    } else if (key == (char)0x87) {
+    } else if (key == KEY_END || key == (char)0x87) {
         *cursor_pos = len;
         return 1;
-    } else if (key == (char)0x88 || key == 0x7F) {
+    } else if (key == KEY_DELETE || key == (char)0x88 || (unsigned char)key == 0x7F) {
         if (pos < len) {
             for (int i = pos; i < len; i++) text[i] = text[i + 1];
             return 1;
         }
+        return 0;
     } else if (key == '\b') {
         if (pos > 0) {
             for (int i = pos - 1; i < len; i++) text[i] = text[i + 1];
             *cursor_pos = pos - 1;
             return 1;
         }
-    } else if ((unsigned char)key >= 32 && len < max_len - 1) {
+        return 0;
+    } else if ((unsigned char)key >= 32 && (unsigned char)key < 127 && len < max_len - 1) {
         for (int i = len; i >= pos; i--) text[i + 1] = text[i];
         text[pos] = key;
         *cursor_pos = pos + 1;
         return 1;
     }
     return 0;
+}
+
+int velo_ui_textbox_handle_click(const char *text, int *cursor_pos, int click_x, int box_text_start_x, int char_w) {
+    if (!text || !cursor_pos || char_w <= 0) return 0;
+    int len = (int)strlen(text);
+    int cpos = (click_x - box_text_start_x + (char_w / 2)) / char_w;
+    if (cpos < 0) cpos = 0;
+    if (cpos > len) cpos = len;
+    *cursor_pos = cpos;
+    return 1;
 }
 
 int velo_poll_event(int win, velo_event_t *ev) {
@@ -484,7 +496,7 @@ int rand(void) {
 void srand(unsigned int seed) { g_next_rand = seed; }
 
 // ====================================================
-// PRINTF & SCHNELLER RAM-PUFFER (KEIN LAG BEIM SCHREIBEN)
+// PRINTF & SCHNELLER RAM-PUFFER
 // ====================================================
 static void append_stdout(const char *buf, size_t len) {
     if (!buf || len == 0) return;

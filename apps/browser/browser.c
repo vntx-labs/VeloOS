@@ -4,7 +4,6 @@
 #include <ctype.h>
 #include <velo/window.h>
 #include <velo/syscall.h>
-#include <velo/litehtml_bridge.h>
 
 #define WIN_DEFAULT_W 880
 #define WIN_DEFAULT_H 600
@@ -28,47 +27,34 @@ static int  g_url_cursor = 10;
 static int  g_url_focused = 0;
 
 typedef struct {
-    int            active;
-    char           url[256];
-    char           title[64];
-    char           html[131072];
-    litehtml_doc_t doc;
-    char           history[32][256];
-    int            hist_count;
-    int            hist_pos;
-    int            scroll_y;
-    int            max_scroll_y;
-    int            is_loading_async;
-    int            timeout_timer;
-    char           status_text[64];
+    int  active;
+    char url[256];
+    char title[64];
+    char content[131072];
+    char history[32][256];
+    int  hist_count;
+    int  hist_pos;
+    int  scroll_y;
+    int  max_scroll_y;
+    int  is_loading_async;
+    int  timeout_timer;
+    char status_text[64];
 } BrowserTab;
 
 static BrowserTab g_tabs[MAX_TABS];
 static int g_active_tab = 0;
 static int g_tab_count = 1;
 
-static const char* g_default_home_html = 
-"<!DOCTYPE html><html><head><title>Startseite</title>"
-"<style>body { font-family: sans-serif; color: #1e293b; padding: 15px; }"
-"h1 { color: #0f172a; border-bottom: 2px solid #38bdf8; padding-bottom: 8px; }"
-"h2 { color: #1e3a8a; margin-top: 20px; }"
-"a { color: #2563eb; text-decoration: underline; }"
-"li { margin-bottom: 8px; }"
-"hr { border: 0; border-top: 1px solid #cbd5e1; margin: 20px 0; }"
-"</style></head><body>"
-"<h1>Velo Fox Web Browser</h1>"
-"<p>Willkommen in Ihrem nativen 64-Bit Web-Browser fuer <b>VeloOS</b> (Powered by <i>litehtml</i>).</p>"
-"<hr>"
-"<h2>Webseiten & Schnellzugriff</h2>"
-"<ul>"
-"<li><a href=\"http://neverssl.com\">http://neverssl.com</a> - Schnelle unverschluesselte HTTP-Testseite</li>"
-"<li><a href=\"http://info.cern.ch/hypertext/WWW/TheProject.html\">http://info.cern.ch</a> - Erste Webseite der Welt</li>"
-"<li><a href=\"http://example.com\">http://example.com</a> - IANA RFC Testseite</li>"
-"<li><a href=\"C:/Users/Documents/README.TXT\">C:/Users/Documents/README.TXT</a> - Lokale Datei</li>"
-"</ul>"
-"<hr>"
-"<p>Vollstaendige CSS/HTML-Layout-Unterstuetzung ueber LiteHTML-Bridge.</p>"
-"</body></html>";
+static const char* g_default_home_text =
+"=== Velo Fox Web Browser ===\n\n"
+"Willkommen in Ihrem nativen 64-Bit Web-Browser fuer VeloOS.\n"
+"Einfach, schnell, direkt auf Bare-Metal ohne externe C++ Runtimes.\n\n"
+"Schnellzugriff & Testseiten:\n"
+"  -> http://neverssl.com\n"
+"  -> http://info.cern.ch\n"
+"  -> http://example.com\n"
+"  -> C:/Users/Documents/README.TXT\n\n"
+"Tippen Sie eine URL in die Adressleiste und druecken Sie Enter oder [Go].";
 
 static inline int k_isspace(char c) {
     return (c == ' ' || c == '\t' || c == '\n' || c == '\r');
@@ -77,125 +63,26 @@ static inline int k_isspace(char c) {
 void load_url(velo_window_t win, const char* input_url, int add_to_history);
 void render_browser_ui(velo_window_t win);
 
-// =========================================================================
-// LITEHTML BRIDGE CALLBACKS
-// =========================================================================
-static void on_bridge_draw_text(const char *text, int x, int y, unsigned int color) {
-    if (g_browser_win >= 0 && text) {
-        velo_window_draw_text_colored(g_browser_win, text, x, y, (UINT32)color);
-    }
-}
+// Einfaches Filtern von rohen HTML-Tags fuer saubere Textanzeige ohne Parser
+static void strip_tags_copy(char *dest, const char *src, int max_len) {
+    int dp = 0;
+    int in_tag = 0;
 
-static void on_bridge_draw_rect(int x, int y, int w, int h, unsigned int color) {
-    if (g_browser_win >= 0 && w > 0 && h > 0) {
-        velo_window_draw_rect_color(g_browser_win, x, y, w, h, (UINT32)color);
-    }
-}
-
-static void resolve_relative_url(char *out, const char *base_url, const char *link_target, int max_len) {
-    if (!link_target || !link_target[0]) {
-        out[0] = '\0';
-        return;
-    }
-
-    if (strncmp(link_target, "http://", 7) == 0 ||
-        strncmp(link_target, "https://", 8) == 0 ||
-        strcmp(link_target, "about:home") == 0 ||
-        strncmp(link_target, "C:/", 3) == 0 ||
-        strncmp(link_target, "c:/", 3) == 0) {
-        strncpy(out, link_target, max_len - 1);
-        out[max_len - 1] = '\0';
-        return;
-    }
-
-    if (!base_url || strncmp(base_url, "http", 4) != 0) {
-        snprintf(out, max_len, "http://%s", link_target);
-        return;
-    }
-
-    char base_no_hash[256];
-    strncpy(base_no_hash, base_url, sizeof(base_no_hash));
-    char *h = strchr(base_no_hash, '#');
-    if (h) *h = '\0';
-
-    const char *scheme_end = strstr(base_no_hash, "://");
-    if (!scheme_end) {
-        snprintf(out, max_len, "http://%s", link_target);
-        return;
-    }
-    scheme_end += 3;
-
-    const char *first_slash = strchr(scheme_end, '/');
-    if (link_target[0] == '/') {
-        int host_len = first_slash ? (int)(first_slash - base_no_hash) : (int)strlen(base_no_hash);
-        char host_part[256];
-        if (host_len > 255) host_len = 255;
-        strncpy(host_part, base_no_hash, host_len);
-        host_part[host_len] = '\0';
-        snprintf(out, max_len, "%s%s", host_part, link_target);
-        return;
-    }
-
-    const char *last_slash = strrchr(base_no_hash, '/');
-    if (!last_slash || last_slash < scheme_end) {
-        snprintf(out, max_len, "%s/%s", base_no_hash, link_target);
-    } else {
-        int dir_len = (int)(last_slash - base_no_hash) + 1;
-        char dir_part[256];
-        if (dir_len > 255) dir_len = 255;
-        strncpy(dir_part, base_no_hash, dir_len);
-        dir_part[dir_len] = '\0';
-        snprintf(out, max_len, "%s%s", dir_part, link_target);
-    }
-}
-
-static void on_bridge_link_click(const char *url) {
-    if (!url || !url[0]) return;
-    BrowserTab *tab = &g_tabs[g_active_tab];
-    char resolved[256];
-    resolve_relative_url(resolved, tab->url, url, sizeof(resolved));
-    load_url(g_browser_win, resolved, 1);
-}
-
-static void extract_html_title(const char *html, char *out_title, int max_len) {
-    if (!html || !out_title) return;
-    const char *p = html;
-    while (*p) {
-        if (*p == '<' && (strncasecmp(p + 1, "title>", 6) == 0)) {
-            p += 7;
-            while (*p && k_isspace(*p)) p++;
-            int t = 0;
-            while (*p && *p != '<' && t < max_len - 1) {
-                out_title[t++] = *p++;
-            }
-            while (t > 0 && k_isspace(out_title[t - 1])) t--;
-            out_title[t] = '\0';
-            return;
+    for (int i = 0; src[i] != '\0' && dp < max_len - 1; i++) {
+        if (src[i] == '<') {
+            in_tag = 1;
+            continue;
         }
-        p++;
-    }
-}
-
-static void tab_rebuild_document(BrowserTab *tab, int content_w, int content_h) {
-    if (!tab) return;
-    if (tab->doc) {
-        velo_litehtml_destroy_document(tab->doc);
-        tab->doc = NULL;
-    }
-
-    if (tab->html[0]) {
-        tab->doc = velo_litehtml_create_document(tab->html);
-        if (tab->doc) {
-            int render_w = content_w - 40;
-            if (render_w < 200) render_w = 200;
-            velo_litehtml_render(tab->doc, render_w);
-
-            int doc_h = velo_litehtml_get_height(tab->doc);
-            tab->max_scroll_y = (doc_h > content_h) ? (doc_h - content_h + 40) : 0;
-            if (tab->scroll_y > tab->max_scroll_y) tab->scroll_y = tab->max_scroll_y;
-            if (tab->scroll_y < 0) tab->scroll_y = 0;
+        if (src[i] == '>') {
+            in_tag = 0;
+            continue;
+        }
+        if (!in_tag) {
+            if (src[i] == '\r') continue;
+            dest[dp++] = src[i];
         }
     }
+    dest[dp] = '\0';
 }
 
 static void create_tab(velo_window_t win, const char *url) {
@@ -205,7 +92,6 @@ static void create_tab(velo_window_t win, const char *url) {
     BrowserTab *t = &g_tabs[new_idx];
     memset(t, 0, sizeof(BrowserTab));
     t->active = 1;
-    t->doc = NULL;
     strncpy(t->title, "Neuer Tab", sizeof(t->title));
 
     g_active_tab = new_idx;
@@ -214,11 +100,6 @@ static void create_tab(velo_window_t win, const char *url) {
 
 static void close_tab(velo_window_t win, int tab_idx) {
     if (tab_idx < 0 || tab_idx >= g_tab_count) return;
-
-    if (g_tabs[tab_idx].doc) {
-        velo_litehtml_destroy_document(g_tabs[tab_idx].doc);
-        g_tabs[tab_idx].doc = NULL;
-    }
 
     if (g_tab_count == 1) {
         load_url(win, "about:home", 1);
@@ -243,27 +124,51 @@ void render_browser_ui(velo_window_t win) {
     g_browser_win = win;
     BrowserTab *cur_tab = &g_tabs[g_active_tab];
 
-    velo_window_draw_rect_color(win, 0, 0, g_win_w, g_win_h, 0x00FFFFFF);
+    // Hintergrund des Inhaltsbereichs
+    velo_window_draw_rect_color(win, 0, 0, g_win_w, g_win_h, 0x000F172A);
 
     int content_y = TOP_CHROME_HEIGHT;
     int content_w = g_win_w;
     int content_h = g_win_h - TOP_CHROME_HEIGHT - STATUS_BAR_HEIGHT;
 
-    // LiteHTML Dokument zeichnen
-    if (cur_tab->doc) {
-        int render_w = content_w - 40;
-        if (render_w < 200) render_w = 200;
-        velo_litehtml_render(cur_tab->doc, render_w);
+    // Dokumenten-Inhalt als formatierten Text darstellen
+    if (cur_tab->content[0]) {
+        int text_x = 24;
+        int text_y = content_y + 16 - cur_tab->scroll_y;
+        int max_chars = (content_w - 48) / 8;
+        if (max_chars <= 0) max_chars = 1;
 
-        int doc_h = velo_litehtml_get_height(cur_tab->doc);
-        cur_tab->max_scroll_y = (doc_h > content_h) ? (doc_h - content_h + 40) : 0;
-        if (cur_tab->scroll_y > cur_tab->max_scroll_y) cur_tab->scroll_y = cur_tab->max_scroll_y;
-        if (cur_tab->scroll_y < 0) cur_tab->scroll_y = 0;
+        const char *p = cur_tab->content;
+        char line_buf[160];
+        int lp = 0;
+        int total_lines = 0;
 
-        velo_litehtml_draw(cur_tab->doc,
-                           20, content_y + 16 - cur_tab->scroll_y,
-                           0, content_y,
-                           content_w, content_h);
+        while (*p) {
+            if (*p == '\n') {
+                line_buf[lp] = '\0';
+                if (text_y >= content_y && text_y < content_y + content_h - 16) {
+                    velo_window_draw_text_colored(win, line_buf, text_x, text_y, 0x00E2E8F0);
+                }
+                text_y += 18;
+                total_lines++;
+                lp = 0;
+            } else {
+                if (lp < max_chars && lp < (int)sizeof(line_buf) - 1) {
+                    line_buf[lp++] = *p;
+                }
+            }
+            p++;
+        }
+        if (lp > 0) {
+            line_buf[lp] = '\0';
+            if (text_y >= content_y && text_y < content_y + content_h - 16) {
+                velo_window_draw_text_colored(win, line_buf, text_x, text_y, 0x00E2E8F0);
+            }
+            total_lines++;
+        }
+
+        int doc_h = total_lines * 18 + 40;
+        cur_tab->max_scroll_y = (doc_h > content_h) ? (doc_h - content_h) : 0;
     }
 
     // 1. Tab-Leiste
@@ -305,7 +210,7 @@ void render_browser_ui(velo_window_t win) {
         velo_window_draw_text_colored(win, "+", cur_tab_x + 7, 8, 0x00CBD5E1);
     }
 
-    // 2. Toolbar
+    // 2. Toolbar & Adressleiste
     velo_window_draw_gradient(win, 0, TOP_TAB_HEIGHT, g_win_w, TOP_NAV_HEIGHT, 0x001B4D68, 0x000A2434);
     velo_window_draw_rect_color(win, 0, TOP_CHROME_HEIGHT - 1, g_win_w, 1, 0x003A7088);
 
@@ -328,8 +233,8 @@ void render_browser_ui(velo_window_t win) {
     velo_window_draw_rect_color(win, 0, status_y, g_win_w, 1, 0x002B5268);
     velo_window_draw_text_colored(win, cur_tab->status_text, 12, status_y + 4, 0x0094A3B8);
 
-    const char *dns_status = cur_tab->is_loading_async ? "Lade Daten..." : "Online | litehtml Engine";
-    velo_window_draw_text_colored(win, dns_status, g_win_w - 210, status_y + 4, cur_tab->is_loading_async ? 0x0038BDF8 : 0x004ADE80);
+    const char *dns_status = cur_tab->is_loading_async ? "Lade Daten..." : "Online | Velo Native Engine";
+    velo_window_draw_text_colored(win, dns_status, g_win_w - 240, status_y + 4, cur_tab->is_loading_async ? 0x0038BDF8 : 0x004ADE80);
 
     velo_window_redraw();
 }
@@ -365,15 +270,11 @@ void load_url(velo_window_t win, const char* input_url, int add_to_history) {
     g_url_focused = 0;
     tab->scroll_y = 0;
 
-    int content_w = g_win_w;
-    int content_h = g_win_h - TOP_CHROME_HEIGHT - STATUS_BAR_HEIGHT;
-
     if (strcmp(formatted_url, "about:home") == 0) {
-        strncpy(tab->html, g_default_home_html, sizeof(tab->html) - 1);
+        strncpy(tab->content, g_default_home_text, sizeof(tab->content) - 1);
         strncpy(tab->title, "Startseite", sizeof(tab->title));
         snprintf(tab->status_text, sizeof(tab->status_text), "Startseite");
         tab->is_loading_async = 0;
-        tab_rebuild_document(tab, content_w, content_h);
         render_browser_ui(win);
         return;
     }
@@ -391,18 +292,18 @@ void load_url(velo_window_t win, const char* input_url, int add_to_history) {
         tab->is_loading_async = 1;
         tab->timeout_timer = 0;
     } else {
-        int bytes = velo_read_file(formatted_url, tab->html, sizeof(tab->html) - 1);
+        char raw[131072];
+        int bytes = velo_read_file(formatted_url, raw, sizeof(raw) - 1);
         if (bytes <= 0) {
-            snprintf(tab->html, sizeof(tab->html), "<h1>Datei nicht gefunden</h1><p>%s</p>", formatted_url);
+            snprintf(tab->content, sizeof(tab->content), "Datei nicht gefunden:\n%s", formatted_url);
             strncpy(tab->title, "Fehler", sizeof(tab->title));
         } else {
-            tab->html[bytes] = '\0';
-            extract_html_title(tab->html, tab->title, sizeof(tab->title));
-            if (!tab->title[0]) strncpy(tab->title, formatted_url, sizeof(tab->title));
+            raw[bytes] = '\0';
+            strip_tags_copy(tab->content, raw, sizeof(tab->content));
+            strncpy(tab->title, formatted_url, sizeof(tab->title));
         }
         snprintf(tab->status_text, sizeof(tab->status_text), "Fertig");
         tab->is_loading_async = 0;
-        tab_rebuild_document(tab, content_w, content_h);
     }
 
     render_browser_ui(win);
@@ -410,8 +311,6 @@ void load_url(velo_window_t win, const char* input_url, int add_to_history) {
 
 int main(int argc, char** argv) {
     (void)argc; (void)argv;
-
-    velo_litehtml_init(on_bridge_draw_text, on_bridge_draw_rect, on_bridge_link_click);
 
     velo_window_t win = velo_window_create("Velo Fox Web Browser", g_win_w, g_win_h);
     if (win < 0) return 0;
@@ -422,7 +321,6 @@ int main(int argc, char** argv) {
 
     memset(g_tabs, 0, sizeof(g_tabs));
     g_tabs[0].active = 1;
-    g_tabs[0].doc = NULL;
     strncpy(g_tabs[0].title, "Startseite", sizeof(g_tabs[0].title));
     g_tab_count = 1;
     g_active_tab = 0;
@@ -435,7 +333,8 @@ int main(int argc, char** argv) {
 
         if (cur->is_loading_async) {
             int status = 0, bytes_data = 0;
-            velo_http_async_poll(cur->html, sizeof(cur->html), &status, &bytes_data);
+            char raw_buf[131072];
+            velo_http_async_poll(raw_buf, sizeof(raw_buf), &status, &bytes_data);
 
             int phase = (bytes_data >> 24) & 0xFF;
             int bytes = bytes_data & 0xFFFFFF;
@@ -444,27 +343,15 @@ int main(int argc, char** argv) {
             if (status == HTTP_STATUS_READY) {
                 cur->is_loading_async = 0;
                 snprintf(cur->status_text, sizeof(cur->status_text), "Fertig (%d Bytes)", bytes);
-                extract_html_title(cur->html, cur->title, sizeof(cur->title));
-                if (!cur->title[0]) strncpy(cur->title, cur->url, sizeof(cur->title));
-
-                int content_w = g_win_w;
-                int content_h = g_win_h - TOP_CHROME_HEIGHT - STATUS_BAR_HEIGHT;
-                tab_rebuild_document(cur, content_w, content_h);
-
+                strip_tags_copy(cur->content, raw_buf, sizeof(cur->content));
                 render_browser_ui(win);
             } else if (status == HTTP_STATUS_ERROR || cur->timeout_timer > 2000) {
                 cur->is_loading_async = 0;
-                snprintf(cur->html, sizeof(cur->html),
-                    "<h1>Timeout / Verbindungsfehler</h1>"
-                    "<p>Die Verbindung zu <b>%s</b> konnte nicht hergestellt werden.</p>"
-                    "<hr><p><a href=\"about:home\">Zurueck zur Startseite</a></p>", cur->url);
+                snprintf(cur->content, sizeof(cur->content),
+                    "Timeout / Verbindungsfehler\n"
+                    "Die Verbindung zu %s konnte nicht hergestellt werden.\n", cur->url);
                 strncpy(cur->title, "Fehler", sizeof(cur->title));
                 snprintf(cur->status_text, sizeof(cur->status_text), "Timeout beim Laden");
-
-                int content_w = g_win_w;
-                int content_h = g_win_h - TOP_CHROME_HEIGHT - STATUS_BAR_HEIGHT;
-                tab_rebuild_document(cur, content_w, content_h);
-
                 render_browser_ui(win);
             } else if (status == HTTP_STATUS_PENDING) {
                 if (cur->timeout_timer % 30 == 0) {
@@ -488,9 +375,6 @@ int main(int argc, char** argv) {
         if (ev.type == VELO_EV_RESIZE) {
             g_win_w = ev.x;
             g_win_h = ev.y;
-            int content_w = g_win_w;
-            int content_h = g_win_h - TOP_CHROME_HEIGHT - STATUS_BAR_HEIGHT;
-            tab_rebuild_document(cur, content_w, content_h);
             render_browser_ui(win);
             continue;
         }
@@ -576,19 +460,6 @@ int main(int argc, char** argv) {
                 load_url(win, g_url_input, 1);
                 continue;
             }
-
-            // Klick in LiteHTML-Dokumentenflaeche
-            if (ev.y >= TOP_CHROME_HEIGHT && ev.y < g_win_h - STATUS_BAR_HEIGHT) {
-                if (cur->doc) {
-                    int doc_x = ev.x - 20;
-                    int doc_y = ev.y - (TOP_CHROME_HEIGHT + 16 - cur->scroll_y);
-                    velo_litehtml_mouse_click(cur->doc, doc_x, doc_y, ev.x, ev.y);
-                }
-                if (g_url_focused) {
-                    g_url_focused = 0;
-                    render_browser_ui(win);
-                }
-            }
         }
 
         if (ev.type == VELO_EV_KEY) {
@@ -601,11 +472,11 @@ int main(int argc, char** argv) {
                     }
                 }
             } else {
-                if (ev.key == (char)0x82) {
+                if (ev.key == (char)0x82) { // Up
                     cur->scroll_y -= 28;
                     if (cur->scroll_y < 0) cur->scroll_y = 0;
                     render_browser_ui(win);
-                } else if (ev.key == (char)0x83) {
+                } else if (ev.key == (char)0x83) { // Down
                     cur->scroll_y += 28;
                     if (cur->scroll_y > cur->max_scroll_y) cur->scroll_y = cur->max_scroll_y;
                     render_browser_ui(win);

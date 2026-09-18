@@ -3,7 +3,6 @@
 #include <string.h>
 #include <velo/window.h>
 #include <velo/syscall.h>
-#include <velo/net.h>
 #include <velo/icons.h>
 
 #define MAX_FILES 1024
@@ -26,6 +25,11 @@ static int g_hist_pos = 0;
 static char g_clipboard_path[128] = "";
 static int g_clipboard_is_cut = 0;
 
+// Scroll-Management
+static int g_scroll_y = 0;
+static int g_max_scroll_y = 0;
+
+// Kontextmenü
 static int g_ctx_open = 0;
 static int g_ctx_x = 0;
 static int g_ctx_y = 0;
@@ -35,6 +39,7 @@ static int g_ctx_is_item = 0;
 #define CTX_ITEM_H 140
 #define CTX_BG_H   112
 
+// Konflikt-Dialog
 static int g_conflict_active = 0;
 static char g_conflict_src[128] = "";
 static char g_conflict_dst[256] = "";
@@ -42,17 +47,20 @@ static char g_conflict_name[32] = "";
 static char g_conflict_suggested_name[32] = "";
 static int g_conflict_is_cut = 0;
 
+// Umbenennen-Dialog
 static int g_rename_active = 0;
 static char g_rename_old_full[128] = "";
-static char g_rename_input[32] = "";
+static char g_rename_input[48] = "";
 static int g_rename_len = 0;
 static int g_rename_cursor = 0;
 
+// Neu-Erstellen-Dialog (1 = Ordner, 2 = Datei)
 static int g_new_item_active = 0;
-static char g_new_item_input[32] = "";
+static char g_new_item_input[48] = "";
 static int g_new_item_len = 0;
 static int g_new_item_cursor = 0;
 
+// Suche
 static char g_search[32] = "";
 static int g_search_len = 0;
 static int g_search_cursor = 0;
@@ -77,7 +85,6 @@ static void safe_str_copy(char *dst, const char *src, size_t max_len) {
     dst[i] = '\0';
 }
 
-/* Systemschutz: Verhindert Löschen, Ausschneiden oder Umbenennen von Systemordnern */
 static int is_system_protected_item(const char *name) {
     if (!name || !name[0]) return 1;
     if (!strcasecmp(name, "EFI") || !strcasecmp(name, "VeloOS") ||
@@ -153,6 +160,7 @@ static void load_dir(const char *path, int record_history) {
     if (!path) return;
 
     safe_str_copy(g_path, path, sizeof(g_path));
+    g_scroll_y = 0;
 
     if (!strcmp(g_path, "Computer")) {
         reload_all_drives();
@@ -253,8 +261,6 @@ static void confirm_create_item(void) {
     }
 
     char target_path[256];
-    memset(target_path, 0, sizeof(target_path));
-    
     size_t len = strlen(g_path);
     if (len > 0 && (g_path[len - 1] == '/' || g_path[len - 1] == '\\')) {
         snprintf(target_path, sizeof(target_path), "%s%s", g_path, g_new_item_input);
@@ -387,7 +393,7 @@ static void conflict_resolve_keep_both(void) {
 static void delete_selected(void) {
     if (g_selected < 0 || g_selected >= g_filtered_count || !strcmp(g_path, "Computer")) return;
     if (is_system_protected_item(g_filtered[g_selected].name)) {
-        return; // SYSTEM-ORDNER/DATEIEN SIND GESCHÜTZT!
+        return;
     }
     char full_p[256];
     get_selected_full_path(full_p);
@@ -428,16 +434,15 @@ static void format_sz(UINT32 s, int is_dir, char *b) {
 static int is_exe(const char *n) {
     if (!n) return 0;
     size_t l = strlen(n);
-    return (l >= 4 && (!strcmp(n + l - 4, ".BIN") || !strcmp(n + l - 4, ".bin") ||
-                       !strcmp(n + l - 4, ".EFI") || !strcmp(n + l - 4, ".efi")));
+    return (l >= 4 && (!strcasecmp(n + l - 4, ".BIN") || !strcasecmp(n + l - 4, ".EFI")));
 }
 
 static int is_doc(const char *n) {
     if (!n) return 0;
     size_t l = strlen(n);
-    return (l >= 4 && (!strcmp(n + l - 4, ".TXT") || !strcmp(n + l - 4, ".txt") ||
-                       !strcmp(n + l - 4, ".DAT") || !strcmp(n + l - 4, ".dat") ||
-                       !strcmp(n + l - 4, ".CFG") || !strcmp(n + l - 4, ".cfg")));
+    return (l >= 4 && (!strcasecmp(n + l - 4, ".TXT") || !strcasecmp(n + l - 4, ".DAT") ||
+                       !strcasecmp(n + l - 4, ".CFG") || !strcasecmp(n + l - 4, ".VP")  ||
+                       !strcasecmp(n + l - 4, ".PY")));
 }
 
 static void open_item(void) {
@@ -472,6 +477,63 @@ static void open_item(void) {
             velo_exec("NOTEPAD.BIN");
         }
     }
+}
+
+/* =========================================================================
+ * PRÄZISE MODAL-DIALOG RENDERING ENGINE
+ * ========================================================================= */
+static void draw_clean_dialog(velo_window_t win, int w, int h, 
+                              const char *title, const char *prompt, 
+                              const char *text, int cursor, 
+                              const char *ok_btn, const char *can_btn) {
+    int dlg_w = 440, dlg_h = 175;
+    int dlg_x = (w - dlg_w) / 2;
+    int dlg_y = (h - dlg_h) / 2;
+
+    // Schatten & Fensterrahmen
+    velo_window_draw_rect_color(win, dlg_x - 3, dlg_y - 3, dlg_w + 6, dlg_h + 6, 0x000F172A);
+    velo_window_draw_gradient(win, dlg_x, dlg_y, dlg_w, dlg_h, 0x001E293B, 0x000F172A);
+    velo_window_draw_rect_color(win, dlg_x, dlg_y, dlg_w, 1, 0x0038BDF8);
+    velo_window_draw_rect_color(win, dlg_x, dlg_y + dlg_h - 1, dlg_w, 1, 0x0038BDF8);
+
+    // Titelleiste
+    velo_window_draw_gradient(win, dlg_x + 1, dlg_y + 1, dlg_w - 2, 28, 0x000284C7, 0x000369A1);
+    velo_window_draw_text_colored(win, title, dlg_x + 14, dlg_y + 7, 0x00FFFFFF);
+
+    // Prompt Text
+    velo_window_draw_text_colored(win, prompt, dlg_x + 20, dlg_y + 44, 0x00CBD5E1);
+
+    // Eingabefeld (Weiß / Hellgrau)
+    int tb_x = dlg_x + 20;
+    int tb_y = dlg_y + 70;
+    int tb_w = dlg_w - 40;
+    int tb_h = 28;
+
+    velo_window_draw_rect_color(win, tb_x, tb_y, tb_w, tb_h, 0x00FFFFFF);
+    velo_window_draw_rect_color(win, tb_x, tb_y, tb_w, 1, 0x0038BDF8);
+    velo_window_draw_rect_color(win, tb_x, tb_y + tb_h - 1, tb_w, 1, 0x0038BDF8);
+    velo_window_draw_rect_color(win, tb_x, tb_y, 1, tb_h, 0x0038BDF8);
+    velo_window_draw_rect_color(win, tb_x + tb_w - 1, tb_y, 1, tb_h, 0x0038BDF8);
+
+    // Text & Cursor im Eingabefeld
+    velo_window_draw_text_colored(win, text, tb_x + 8, tb_y + 6, 0x000F172A);
+    velo_window_draw_rect_color(win, tb_x + 8 + cursor * 8, tb_y + 5, 2, 18, 0x002563EB);
+
+    // Buttons
+    int btn_w = 90, btn_h = 28;
+    int ok_x = dlg_x + dlg_w - 200;
+    int can_x = dlg_x + dlg_w - 100;
+    int btn_y = dlg_y + dlg_h - 38;
+
+    // OK Button
+    velo_window_draw_gradient(win, ok_x, btn_y, btn_w, btn_h, 0x002563EB, 0x001D4ED8);
+    velo_window_draw_rect_color(win, ok_x, btn_y, btn_w, 1, 0x0060A5FA);
+    velo_window_draw_text_colored(win, ok_btn, ok_x + (btn_w - (int)strlen(ok_btn) * 8) / 2, btn_y + 6, 0x00FFFFFF);
+
+    // Cancel Button
+    velo_window_draw_gradient(win, can_x, btn_y, btn_w, btn_h, 0x00475569, 0x00334155);
+    velo_window_draw_rect_color(win, can_x, btn_y, btn_w, 1, 0x0094A3B8);
+    velo_window_draw_text_colored(win, can_btn, can_x + (btn_w - (int)strlen(can_btn) * 8) / 2, btn_y + 6, 0x00FFFFFF);
 }
 
 static void render_explorer(velo_window_t win, int w, int h) {
@@ -518,7 +580,7 @@ static void render_explorer(velo_window_t win, int w, int h) {
         velo_ui_draw_sidebar_item(win, 176, SIDEBAR_WIDTH, "    Downloads", !strcmp(g_path, "C:/Users/Downloads"));
         velo_window_draw_icon(win, VELO_ICON_FOLDER, 10, 173, 16);
 
-        velo_ui_draw_sidebar_item(win, 202, SIDEBAR_WIDTH, "    Programme", !strcmp(g_path, "C:/Program Files"));
+        velo_ui_draw_sidebar_item(win, 202, SIDEBAR_WIDTH, "    Programme", !strcmp(g_path, "C:/Programs") || !strcmp(g_path, "C:/Program Files"));
         velo_window_draw_icon(win, VELO_ICON_FOLDER, 10, 199, 16);
 
         velo_ui_draw_sidebar_item(win, 228, SIDEBAR_WIDTH, "    VeloOS", !strcmp(g_path, "C:/VeloOS"));
@@ -527,10 +589,11 @@ static void render_explorer(velo_window_t win, int w, int h) {
 
     int main_x = SIDEBAR_WIDTH;
     int main_w = w - SIDEBAR_WIDTH;
+    int view_h = h - 64 - DETAILS_HEIGHT;
 
     if (!strcmp(g_path, "Computer")) {
         int disk_start_x = main_x + 20;
-        int disk_start_y = 80;
+        int disk_start_y = 80 - g_scroll_y;
 
         char cat_header[64];
         sprintf(cat_header, "Festplattenlaufwerke (%d)", g_drive_count);
@@ -541,39 +604,41 @@ static void render_explorer(velo_window_t win, int w, int h) {
 
         int card_y = disk_start_y + 24;
         for (int d = 0; d < g_drive_count; d++) {
-            if (card_y + 64 > h - DETAILS_HEIGHT) break;
+            if (card_y + 64 >= 64 && card_y < h - DETAILS_HEIGHT) {
+                if (g_selected == d) {
+                    velo_window_draw_gradient(win, disk_start_x, card_y, 300, 64, 0x00EBF4FB, 0x00CCE6FE);
+                    velo_window_draw_rect_color(win, disk_start_x, card_y, 300, 1, 0x0078B4E6);
+                    velo_window_draw_rect_color(win, disk_start_x, card_y + 63, 300, 1, 0x0078B4E6);
+                    velo_window_draw_rect_color(win, disk_start_x, card_y, 1, 64, 0x0078B4E6);
+                    velo_window_draw_rect_color(win, disk_start_x + 299, card_y, 1, 64, 0x0078B4E6);
+                } else {
+                    velo_window_draw_rect_color(win, disk_start_x, card_y, 300, 64, 0x00F8FAFC);
+                }
 
-            if (g_selected == d) {
-                velo_window_draw_gradient(win, disk_start_x, card_y, 300, 64, 0x00EBF4FB, 0x00CCE6FE);
-                velo_window_draw_rect_color(win, disk_start_x, card_y, 300, 1, 0x0078B4E6);
-                velo_window_draw_rect_color(win, disk_start_x, card_y + 63, 300, 1, 0x0078B4E6);
-                velo_window_draw_rect_color(win, disk_start_x, card_y, 1, 64, 0x0078B4E6);
-                velo_window_draw_rect_color(win, disk_start_x + 299, card_y, 1, 64, 0x0078B4E6);
-            } else {
-                velo_window_draw_rect_color(win, disk_start_x, card_y, 300, 64, 0x00F8FAFC);
+                velo_window_draw_icon(win, VELO_ICON_PC, disk_start_x + 12, card_y + 16, 32);
+
+                char disk_title[64];
+                sprintf(disk_title, "Datentraeger (%s)", g_drives[d].label);
+                velo_window_draw_text_colored(win, disk_title, disk_start_x + 56, card_y + 8, 0x000F172A);
+
+                char free_str[32], total_str[32], stat_str[80];
+                format_bytes_human(g_drives[d].free_bytes, free_str);
+                format_bytes_human(g_drives[d].total_bytes, total_str);
+                sprintf(stat_str, "%s frei von %s", free_str, total_str);
+
+                int used_pct = 0;
+                if (g_drives[d].total_bytes > 0 && g_drives[d].total_bytes >= g_drives[d].free_bytes) {
+                    used_pct = (int)(((g_drives[d].total_bytes - g_drives[d].free_bytes) * 100ULL) / g_drives[d].total_bytes);
+                }
+
+                velo_ui_draw_storage_bar(win, disk_start_x + 56, card_y + 28, 220, used_pct);
+                velo_window_draw_text_colored(win, stat_str, disk_start_x + 56, card_y + 46, 0x0064748B);
             }
-
-            velo_window_draw_icon(win, VELO_ICON_PC, disk_start_x + 12, card_y + 16, 32);
-
-            char disk_title[64];
-            sprintf(disk_title, "Datentraeger (%s)", g_drives[d].label);
-            velo_window_draw_text_colored(win, disk_title, disk_start_x + 56, card_y + 8, 0x000F172A);
-
-            char free_str[32], total_str[32], stat_str[80];
-            format_bytes_human(g_drives[d].free_bytes, free_str);
-            format_bytes_human(g_drives[d].total_bytes, total_str);
-            sprintf(stat_str, "%s frei von %s", free_str, total_str);
-
-            int used_pct = 0;
-            if (g_drives[d].total_bytes > 0 && g_drives[d].total_bytes >= g_drives[d].free_bytes) {
-                used_pct = (int)(((g_drives[d].total_bytes - g_drives[d].free_bytes) * 100ULL) / g_drives[d].total_bytes);
-            }
-
-            velo_ui_draw_storage_bar(win, disk_start_x + 56, card_y + 28, 220, used_pct);
-            velo_window_draw_text_colored(win, stat_str, disk_start_x + 56, card_y + 46, 0x0064748B);
-
             card_y += 72;
         }
+
+        int total_content_h = 24 + g_drive_count * 72;
+        g_max_scroll_y = (total_content_h > view_h) ? (total_content_h - view_h + 30) : 0;
 
     } else {
         int tile_w = 230;
@@ -581,12 +646,16 @@ static void render_explorer(velo_window_t win, int w, int h) {
         int gap_x = 12;
         int gap_y = 10;
 
-        int avail_w = main_w - 30;
+        int avail_w = main_w - 36;
         int num_cols = (avail_w > 0) ? (avail_w / (tile_w + gap_x)) : 1;
         if (num_cols < 1) num_cols = 1;
 
         int start_x = main_x + 16;
-        int start_y = 76;
+        int start_y = 76 - g_scroll_y;
+
+        int total_rows = (g_filtered_count + num_cols - 1) / num_cols;
+        int total_content_h = total_rows * (tile_h + gap_y);
+        g_max_scroll_y = (total_content_h > view_h) ? (total_content_h - view_h + 40) : 0;
 
         for (int i = 0; i < g_filtered_count; i++) {
             int col = i % num_cols;
@@ -594,7 +663,8 @@ static void render_explorer(velo_window_t win, int w, int h) {
             int tx = start_x + col * (tile_w + gap_x);
             int ty = start_y + row * (tile_h + gap_y);
 
-            if (ty + tile_h > h - DETAILS_HEIGHT) break;
+            // Nur sichtbare Kacheln zeichnen
+            if (ty + tile_h < 64 || ty >= h - DETAILS_HEIGHT) continue;
 
             if (i == g_selected) {
                 velo_window_draw_gradient(win, tx, ty, tile_w, tile_h, 0x00EBF4FB, 0x00CCE6FE);
@@ -637,6 +707,21 @@ static void render_explorer(velo_window_t win, int w, int h) {
         }
     }
 
+    // Eleganter Scrollbalken
+    if (g_max_scroll_y > 0 && view_h > 40) {
+        int sb_x = w - 10;
+        int sb_y = 64;
+        int sb_w = 6;
+        int sb_h = view_h;
+        velo_window_draw_rect_color(win, sb_x, sb_y, sb_w, sb_h, 0x00E2E8F0);
+
+        int thumb_h = (view_h * view_h) / (view_h + g_max_scroll_y);
+        if (thumb_h < 24) thumb_h = 24;
+        int thumb_y = sb_y + (g_scroll_y * (sb_h - thumb_h)) / g_max_scroll_y;
+        velo_window_draw_gradient(win, sb_x, thumb_y, sb_w, thumb_h, 0x0038BDF8, 0x000284C7);
+    }
+
+    // Detail-Bereich unten
     int det_y = h - DETAILS_HEIGHT;
     if (det_y > 0) {
         velo_window_draw_gradient(win, 0, det_y, w, DETAILS_HEIGHT, 0x00E0F2FE, 0x00BAE6FD);
@@ -693,19 +778,16 @@ static void render_explorer(velo_window_t win, int w, int h) {
         }
     }
 
+    // Modal-Dialoge
     if (g_new_item_active) {
-        int dlg_w = 420, dlg_h = 170;
-        int dlg_x = (w - dlg_w) / 2, dlg_y = (h - dlg_h) / 2;
-        velo_ui_draw_modal_dialog(win, dlg_x, dlg_y, dlg_w, dlg_h, 
-            (g_new_item_active == 1) ? "Neuen Ordner erstellen" : "Neue Datei erstellen",
+        draw_clean_dialog(win, w, h, 
+            (g_new_item_active == 1) ? "Neuen Ordner erstellen" : "Neues Dokument erstellen",
             (g_new_item_active == 1) ? "Ordnername eingeben:" : "Dateiname eingeben:",
             g_new_item_input, g_new_item_cursor, "Erstellen", "Abbrechen");
     }
 
     if (g_rename_active) {
-        int dlg_w = 420, dlg_h = 170;
-        int dlg_x = (w - dlg_w) / 2, dlg_y = (h - dlg_h) / 2;
-        velo_ui_draw_modal_dialog(win, dlg_x, dlg_y, dlg_w, dlg_h, 
+        draw_clean_dialog(win, w, h, 
             "Element umbenennen", "Neuen Namen eingeben:",
             g_rename_input, g_rename_cursor, "OK", "Abbrechen");
     }
@@ -745,6 +827,7 @@ static void render_explorer(velo_window_t win, int w, int h) {
         velo_ui_draw_button(win, c_btn_x, c_btn_y, 70, 26, "Abbrechen", 0x00F1F5F9, 0x00E2E8F0, 0x00CBD5E1, 0x000F172A);
     }
 
+    // Kontextmenü
     if (g_ctx_open) {
         int cx = g_ctx_x;
         int cy = g_ctx_y;
@@ -842,7 +925,7 @@ int main(int argc, char **argv) {
         if (st == -1) break;
 
         if (st == 0) {
-            velo_thread_sleep(1);
+            velo_syscall(SYS_TASK_SLEEP, 1, 0, 0, 0);
             continue;
         }
 
@@ -853,15 +936,28 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        // MAUSRAD SCROLLING
+        if (st == 1 && ev.type == VELO_EV_SCROLL) {
+            int delta = ev.scroll_y ? ev.scroll_y : (ev.y > 0 ? 1 : -1);
+            g_scroll_y -= delta * 36;
+            if (g_scroll_y < 0) g_scroll_y = 0;
+            if (g_scroll_y > g_max_scroll_y) g_scroll_y = g_max_scroll_y;
+            render_explorer(win, g_cur_w, g_cur_h);
+            continue;
+        }
+
+        // RECHTSKLICK KONTEXTMENÜ
         if (st == 1 && ev.type == VELO_EV_RCLICK) {
+            if (g_new_item_active || g_rename_active || g_conflict_active) continue;
+
             if (ev.y >= 64 && ev.y <= g_cur_h - DETAILS_HEIGHT && ev.x >= SIDEBAR_WIDTH) {
                 int tile_w = 230, tile_h = 50, gap_x = 12, gap_y = 10;
-                int avail_w = (g_cur_w - SIDEBAR_WIDTH) - 30;
+                int avail_w = (g_cur_w - SIDEBAR_WIDTH) - 36;
                 int num_cols = (avail_w > 0) ? (avail_w / (tile_w + gap_x)) : 1;
                 if (num_cols < 1) num_cols = 1;
 
                 int start_x = SIDEBAR_WIDTH + 16;
-                int start_y = 76;
+                int start_y = 76 - g_scroll_y;
                 int clicked_tile = -1;
 
                 for (int i = 0; i < g_filtered_count; i++) {
@@ -890,7 +986,9 @@ int main(int argc, char **argv) {
             }
         }
 
+        // LINKER MAUSKLICK
         if (st == 1 && ev.type == VELO_EV_CLICK) {
+            // 1. Kontextmenü aktiv
             if (g_ctx_open) {
                 int cx = g_ctx_x;
                 int cy = g_ctx_y;
@@ -924,30 +1022,49 @@ int main(int argc, char **argv) {
                 }
             }
 
+            // 2. Erstellen-Dialog (Ordner / Datei)
             if (g_new_item_active) {
-                int dlg_w = 420, dlg_h = 170;
-                int dlg_x = (g_cur_w - dlg_w) / 2, dlg_y = (g_cur_h - dlg_h) / 2;
-                int ok_x = dlg_x + dlg_w - 170, ok_y = dlg_y + dlg_h - 40;
-                int can_x = dlg_x + dlg_w - 90;
+                int dlg_w = 440, dlg_h = 175;
+                int dlg_x = (g_cur_w - dlg_w) / 2;
+                int dlg_y = (g_cur_h - dlg_h) / 2;
+                int btn_y = dlg_y + dlg_h - 38;
+                int ok_x = dlg_x + dlg_w - 200;
+                int can_x = dlg_x + dlg_w - 100;
 
-                if (velo_ui_in_rect(ev.x, ev.y, ok_x, ok_y, 70, 26)) confirm_create_item();
-                else if (velo_ui_in_rect(ev.x, ev.y, can_x, ok_y, 70, 26)) cancel_create_item();
+                if (velo_ui_in_rect(ev.x, ev.y, ok_x, btn_y, 90, 28)) confirm_create_item();
+                else if (velo_ui_in_rect(ev.x, ev.y, can_x, btn_y, 90, 28)) cancel_create_item();
+                else if (velo_ui_in_rect(ev.x, ev.y, dlg_x + 20, dlg_y + 70, dlg_w - 40, 28)) {
+                    int cpos = (ev.x - (dlg_x + 28)) / 8;
+                    if (cpos < 0) cpos = 0;
+                    if (cpos > g_new_item_len) cpos = g_new_item_len;
+                    g_new_item_cursor = cpos;
+                }
                 render_explorer(win, g_cur_w, g_cur_h);
                 continue;
             }
 
+            // 3. Umbenennen-Dialog
             if (g_rename_active) {
-                int dlg_w = 420, dlg_h = 170;
-                int dlg_x = (g_cur_w - dlg_w) / 2, dlg_y = (g_cur_h - dlg_h) / 2;
-                int ok_x = dlg_x + dlg_w - 170, ok_y = dlg_y + dlg_h - 40;
-                int can_x = dlg_x + dlg_w - 90;
+                int dlg_w = 440, dlg_h = 175;
+                int dlg_x = (g_cur_w - dlg_w) / 2;
+                int dlg_y = (g_cur_h - dlg_h) / 2;
+                int btn_y = dlg_y + dlg_h - 38;
+                int ok_x = dlg_x + dlg_w - 200;
+                int can_x = dlg_x + dlg_w - 100;
 
-                if (velo_ui_in_rect(ev.x, ev.y, ok_x, ok_y, 70, 26)) confirm_rename();
-                else if (velo_ui_in_rect(ev.x, ev.y, can_x, ok_y, 70, 26)) cancel_rename();
+                if (velo_ui_in_rect(ev.x, ev.y, ok_x, btn_y, 90, 28)) confirm_rename();
+                else if (velo_ui_in_rect(ev.x, ev.y, can_x, btn_y, 90, 28)) cancel_rename();
+                else if (velo_ui_in_rect(ev.x, ev.y, dlg_x + 20, dlg_y + 70, dlg_w - 40, 28)) {
+                    int cpos = (ev.x - (dlg_x + 28)) / 8;
+                    if (cpos < 0) cpos = 0;
+                    if (cpos > g_rename_len) cpos = g_rename_len;
+                    g_rename_cursor = cpos;
+                }
                 render_explorer(win, g_cur_w, g_cur_h);
                 continue;
             }
 
+            // 4. Dateikonflikt-Dialog
             if (g_conflict_active) {
                 int dlg_w = 480, dlg_h = 280;
                 int dlg_x = (g_cur_w - dlg_w) / 2, dlg_y = (g_cur_h - dlg_h) / 2;
@@ -960,6 +1077,7 @@ int main(int argc, char **argv) {
                 continue;
             }
 
+            // Navigationsleiste Zurück
             if (velo_ui_in_rect(ev.x, ev.y, 8, 6, 26, 26)) {
                 if (g_hist_pos > 1) {
                     g_hist_pos -= 2;
@@ -971,6 +1089,7 @@ int main(int argc, char **argv) {
                 continue;
             }
 
+            // Command-Bar Buttons
             if (velo_ui_in_rect(ev.x, ev.y, 10, 36, 60, 28)) { start_create_folder(); render_explorer(win, g_cur_w, g_cur_h); continue; }
             else if (velo_ui_in_rect(ev.x, ev.y, 78, 36, 48, 28)) { start_create_file(); render_explorer(win, g_cur_w, g_cur_h); continue; }
             else if (velo_ui_in_rect(ev.x, ev.y, 134, 36, 38, 28)) { copy_selected(); render_explorer(win, g_cur_w, g_cur_h); continue; }
@@ -979,6 +1098,7 @@ int main(int argc, char **argv) {
             else if (velo_ui_in_rect(ev.x, ev.y, 272, 36, 54, 28)) { start_rename_selected(); render_explorer(win, g_cur_w, g_cur_h); continue; }
             else if (velo_ui_in_rect(ev.x, ev.y, 334, 36, 54, 28)) { delete_selected(); render_explorer(win, g_cur_w, g_cur_h); continue; }
 
+            // Suchbox
             int s_box_x = 72 + (g_cur_w - 72 - 160 - 14) + 6;
             if (velo_ui_in_rect(ev.x, ev.y, s_box_x, 6, 160, 26)) {
                 g_search_focused = 1;
@@ -990,20 +1110,22 @@ int main(int argc, char **argv) {
                 render_explorer(win, g_cur_w, g_cur_h);
             }
 
+            // Sidebar-Favoriten
             if (velo_ui_in_rect(ev.x, ev.y, 0, 90, SIDEBAR_WIDTH, 170)) {
                 if (ev.y <= 112) load_dir("Computer", 1);
                 else if (ev.y <= 138) load_dir("C:/Users/Documents", 1);
                 else if (ev.y <= 164) load_dir("C:/Users/Pictures", 1);
                 else if (ev.y <= 190) load_dir("C:/Users/Downloads", 1);
-                else if (ev.y <= 216) load_dir("C:/Program Files", 1);
+                else if (ev.y <= 216) load_dir("C:/Programs", 1);
                 else load_dir("C:/VeloOS", 1);
                 render_explorer(win, g_cur_w, g_cur_h);
                 continue;
             }
 
+            // Computer-Ansicht Klick
             if (!strcmp(g_path, "Computer")) {
                 int clicked_drive = -1;
-                int card_y = 104;
+                int card_y = 104 - g_scroll_y;
                 for (int d = 0; d < g_drive_count; d++) {
                     if (velo_ui_in_rect(ev.x, ev.y, SIDEBAR_WIDTH + 20, card_y, 300, 64)) {
                         clicked_drive = d;
@@ -1024,23 +1146,25 @@ int main(int argc, char **argv) {
                 }
             } else {
                 int tile_w = 230, tile_h = 50, gap_x = 12, gap_y = 10;
-                int avail_w = (g_cur_w - SIDEBAR_WIDTH) - 30;
+                int avail_w = (g_cur_w - SIDEBAR_WIDTH) - 36;
                 int num_cols = (avail_w > 0) ? (avail_w / (tile_w + gap_x)) : 1;
                 if (num_cols < 1) num_cols = 1;
 
                 int start_x = SIDEBAR_WIDTH + 16;
-                int start_y = 76;
+                int start_y = 76 - g_scroll_y;
                 int clicked_tile = -1;
 
-                for (int i = 0; i < g_filtered_count; i++) {
-                    int col = i % num_cols;
-                    int row = i / num_cols;
-                    int tx = start_x + col * (tile_w + gap_x);
-                    int ty = start_y + row * (tile_h + gap_y);
+                if (ev.y >= 64 && ev.y < g_cur_h - DETAILS_HEIGHT) {
+                    for (int i = 0; i < g_filtered_count; i++) {
+                        int col = i % num_cols;
+                        int row = i / num_cols;
+                        int tx = start_x + col * (tile_w + gap_x);
+                        int ty = start_y + row * (tile_h + gap_y);
 
-                    if (velo_ui_in_rect(ev.x, ev.y, tx, ty, tile_w, tile_h)) {
-                        clicked_tile = i;
-                        break;
+                        if (velo_ui_in_rect(ev.x, ev.y, tx, ty, tile_w, tile_h)) {
+                            clicked_tile = i;
+                            break;
+                        }
                     }
                 }
 
@@ -1066,23 +1190,14 @@ int main(int argc, char **argv) {
             }
         }
 
+        // TASTATUR-EVENTS
         if (st == 1 && ev.type == VELO_EV_KEY) {
-            if (ev.key == KEY_CTRL_C) { copy_selected(); render_explorer(win, g_cur_w, g_cur_h); continue; }
-            if (ev.key == KEY_CTRL_X) { cut_selected(); render_explorer(win, g_cur_w, g_cur_h); continue; }
-            if (ev.key == KEY_CTRL_V) { paste_clipboard(); render_explorer(win, g_cur_w, g_cur_h); continue; }
-            if (ev.key == KEY_CTRL_A) { g_selected = 0; render_explorer(win, g_cur_w, g_cur_h); continue; }
-
-            if (ev.key == (char)0x1B && g_ctx_open) {
-                g_ctx_open = 0;
-                render_explorer(win, g_cur_w, g_cur_h);
-                continue;
-            }
-
+            // Dialog: Erstellen aktiv
             if (g_new_item_active) {
-                if (ev.key == '\n') confirm_create_item();
+                if (ev.key == '\n' || ev.key == '\r') confirm_create_item();
                 else if (ev.key == (char)0x1B) cancel_create_item();
-                else if (ev.key == KEY_LEFT || ev.key == (char)0x84) { if (g_new_item_cursor > 0) g_new_item_cursor--; }
-                else if (ev.key == KEY_RIGHT || ev.key == (char)0x85) { if (g_new_item_cursor < g_new_item_len) g_new_item_cursor++; }
+                else if (ev.key == (char)0x84 || ev.key == KEY_LEFT) { if (g_new_item_cursor > 0) g_new_item_cursor--; }
+                else if (ev.key == (char)0x85 || ev.key == KEY_RIGHT) { if (g_new_item_cursor < g_new_item_len) g_new_item_cursor++; }
                 else if (ev.key == '\b') {
                     if (g_new_item_cursor > 0) {
                         for (int i = g_new_item_cursor - 1; i < g_new_item_len; i++) {
@@ -1090,8 +1205,10 @@ int main(int argc, char **argv) {
                         }
                         g_new_item_len--; g_new_item_cursor--;
                     }
-                } else if ((unsigned char)ev.key >= 32 && (unsigned char)ev.key < 127 && g_new_item_len < 26) {
-                    for (int i = g_new_item_len; i >= g_new_item_cursor; i--) g_new_item_input[i + 1] = g_new_item_input[i];
+                } else if ((unsigned char)ev.key >= 32 && (unsigned char)ev.key < 127 && g_new_item_len < 30) {
+                    for (int i = g_new_item_len; i >= g_new_item_cursor; i--) {
+                        g_new_item_input[i + 1] = g_new_item_input[i];
+                    }
                     g_new_item_input[g_new_item_cursor] = ev.key;
                     g_new_item_len++; g_new_item_cursor++;
                 }
@@ -1099,11 +1216,12 @@ int main(int argc, char **argv) {
                 continue;
             }
 
+            // Dialog: Umbenennen aktiv
             if (g_rename_active) {
-                if (ev.key == '\n') confirm_rename();
+                if (ev.key == '\n' || ev.key == '\r') confirm_rename();
                 else if (ev.key == (char)0x1B) cancel_rename();
-                else if (ev.key == KEY_LEFT || ev.key == (char)0x84) { if (g_rename_cursor > 0) g_rename_cursor--; }
-                else if (ev.key == KEY_RIGHT || ev.key == (char)0x85) { if (g_rename_cursor < g_rename_len) g_rename_cursor++; }
+                else if (ev.key == (char)0x84 || ev.key == KEY_LEFT) { if (g_rename_cursor > 0) g_rename_cursor--; }
+                else if (ev.key == (char)0x85 || ev.key == KEY_RIGHT) { if (g_rename_cursor < g_rename_len) g_rename_cursor++; }
                 else if (ev.key == '\b') {
                     if (g_rename_cursor > 0) {
                         for (int i = g_rename_cursor - 1; i < g_rename_len; i++) {
@@ -1111,8 +1229,10 @@ int main(int argc, char **argv) {
                         }
                         g_rename_len--; g_rename_cursor--;
                     }
-                } else if ((unsigned char)ev.key >= 32 && (unsigned char)ev.key < 127 && g_rename_len < 26) {
-                    for (int i = g_rename_len; i >= g_rename_cursor; i--) g_rename_input[i + 1] = g_rename_input[i];
+                } else if ((unsigned char)ev.key >= 32 && (unsigned char)ev.key < 127 && g_rename_len < 30) {
+                    for (int i = g_rename_len; i >= g_rename_cursor; i--) {
+                        g_rename_input[i + 1] = g_rename_input[i];
+                    }
                     g_rename_input[g_rename_cursor] = ev.key;
                     g_rename_len++; g_rename_cursor++;
                 }
@@ -1120,20 +1240,40 @@ int main(int argc, char **argv) {
                 continue;
             }
 
-            if ((unsigned char)ev.key == 0x88 || (unsigned char)ev.key == 0x7F) {
-                if (!g_search_focused && g_selected >= 0 && g_selected < g_filtered_count) {
-                    delete_selected();
+            // Shortcuts nur ausführen, wenn KEIN Dialog & KEINE Suche aktiv ist
+            if (!g_search_focused) {
+                if (ev.key == KEY_CTRL_C) { copy_selected(); render_explorer(win, g_cur_w, g_cur_h); continue; }
+                if (ev.key == KEY_CTRL_X) { cut_selected(); render_explorer(win, g_cur_w, g_cur_h); continue; }
+                if (ev.key == KEY_CTRL_V) { paste_clipboard(); render_explorer(win, g_cur_w, g_cur_h); continue; }
+                if (ev.key == KEY_CTRL_A) { g_selected = 0; render_explorer(win, g_cur_w, g_cur_h); continue; }
+
+                if (ev.key == (char)0x82) { // Up
+                    g_scroll_y -= 36;
+                    if (g_scroll_y < 0) g_scroll_y = 0;
                     render_explorer(win, g_cur_w, g_cur_h);
                     continue;
                 }
+                if (ev.key == (char)0x83) { // Down
+                    g_scroll_y += 36;
+                    if (g_scroll_y > g_max_scroll_y) g_scroll_y = g_max_scroll_y;
+                    render_explorer(win, g_cur_w, g_cur_h);
+                    continue;
+                }
+
+                if ((unsigned char)ev.key == 0x88 || (unsigned char)ev.key == 0x7F) {
+                    if (g_selected >= 0 && g_selected < g_filtered_count) {
+                        delete_selected();
+                        render_explorer(win, g_cur_w, g_cur_h);
+                        continue;
+                    }
+                }
+
+                if (ev.key == '\n' || ev.key == '\r') { open_item(); render_explorer(win, g_cur_w, g_cur_h); continue; }
+                if (ev.key == 'r' || ev.key == 'R') { start_rename_selected(); render_explorer(win, g_cur_w, g_cur_h); continue; }
             }
 
-            if (ev.key == '\n') { open_item(); render_explorer(win, g_cur_w, g_cur_h); }
-            else if (!g_search_focused && (ev.key == 'r' || ev.key == 'R')) { start_rename_selected(); render_explorer(win, g_cur_w, g_cur_h); }
-            else if (!g_search_focused && (ev.key == 'c' || ev.key == 'C')) { copy_selected(); render_explorer(win, g_cur_w, g_cur_h); }
-            else if (!g_search_focused && (ev.key == 'x' || ev.key == 'X')) { cut_selected(); render_explorer(win, g_cur_w, g_cur_h); }
-            else if (!g_search_focused && (ev.key == 'v' || ev.key == 'V')) { paste_clipboard(); render_explorer(win, g_cur_w, g_cur_h); }
-            else if (g_search_focused) {
+            // Suchfeld Tastatureingaben
+            if (g_search_focused) {
                 if (ev.key == '\b') {
                     if (g_search_cursor > 0) {
                         for (int i = g_search_cursor - 1; i < g_search_len; i++) g_search[i] = g_search[i + 1];

@@ -104,7 +104,7 @@ static void disable_legacy_pic(void) {
 /* =========================================================================
  * PROZESS-SPEZIFISCHE ASYNCHRONE EVENT-QUEUE
  * ========================================================================= */
-void task_push_event(int task_id, int type, int x, int y, char key) {
+ void task_push_event(int task_id, int type, int x, int y, char key, int sx, int sy) {
     if (task_id < 0 || task_id >= MAX_TASKS) return;
     Task *t = &g_tasks[task_id];
     if (t->state == TASK_UNUSED || t->state == TASK_DEAD) return;
@@ -115,6 +115,8 @@ void task_push_event(int task_id, int type, int x, int y, char key) {
         t->event_queue.buffer[t->event_queue.head].x = x;
         t->event_queue.buffer[t->event_queue.head].y = y;
         t->event_queue.buffer[t->event_queue.head].key = key;
+        t->event_queue.buffer[t->event_queue.head].scroll_x = sx;
+        t->event_queue.buffer[t->event_queue.head].scroll_y = sy;
         t->event_queue.head = next;
     }
 }

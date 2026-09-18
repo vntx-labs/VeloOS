@@ -1,70 +1,57 @@
-![visitors](https://laobi.icu/badge?page_id=vntx-labs.visitor-badge&left_text=Total%20Visitors%3A&left_color=%231a5fb4&right_color=%231a5fb4&radius=10&height=25)
-# VeloOS - Patch Notes & Release Readme (v12.3.0)
+# VeloOS
 
-Welcome to **VeloOS v12.3.0**, a major incremental release focusing on architectural hardening, robust multitasking isolation, and expanded low-level stability. This document outlines the key updates, bug fixes, and technical enhancements introduced in version 12.3.0.
-
----
-
-## 🚀 Overview & Key Highlights
-
-Version 12.3.0 introduces critical improvements to the x86_64 kernel core, memory management unit (MMU/PMM/VMM), hardware-level process isolation, and the window compositor subsystem. It also includes comprehensive fixes for input polling, exception handling, and device driver communication.
+**VeloOS: Fast, minimal, and resilient. A low-level kernel project born from rapid prototyping and persistent debugging. Part of the 'Velo' ecosystem—engineered for performance and open-source collaboration.**
 
 ---
 
-## 🛠️ Detailed Patch Notes & Changes
+## 🌌 Projekt-Übersicht
 
-### 1. Kernel Architecture & Memory Management (`kernel.c`, `pmm_vmm.h`, `sched.c`)
-- **Robust GOP Initialization (`init_gop`):** Improved Graphic Output Protocol fallback and resolution management. The system now securely requests 1024x768 or safely retains firmware-standard resolutions with resilient multi-buffer allocations.
-- **Hardware-Checked SSE Initialization (`enable_sse`):** Implemented strict CPUID checks (EDX bits 24 and 25 for FXSR and SSE) before setting CR0/CR4 bits (`OSFXSR`, `OSXMMEXCPT`), preventing illegal instruction exceptions on legacy or specialized virtualized hardware.
-- **Real RAM Detection (`detect_real_ram_from_mmap`):** Upgraded UEFI memory map parsing to accurately accumulate conventional, loader, and boot services memory sectors into a unified RAM counter (`g_total_ram_mb`).
-- **Autonomic TTY & Session Controller:** Enhanced TTY switching (`Alt + 1` through `Alt + 8`) and implemented a robust magic recovery/supervisor sequence (`Alt + Del` followed by typing `desktop`) to cleanly restart or switch out of frozen UI sessions without rebooting the kernel.
+VeloOS ist ein von Grund auf selbst entwickeltes, **hoch-modulares 64-Bit Bare-Metal-Betriebssystem**, das den nackten x86_64-Long-Mode direkt außerhalb der UEFI-Umgebung kontrolliert. Das System verzichtet komplett auf bestehende Linux- oder Windows-Kernelstrukturen und setzt auf eine vertikal integrierte Grafik- und Input-Pipeline für maximale Performance bei absoluter Null-Latenz.
 
-### 2. Preemptive Multitasking & PML4 Isolation (`sched.c`)
-- **True PML4 Context Switching:** Each user task now operates within its own hardware-enforced address space (`cr3_pml4`). During APIC timer preemption ticks (`sched_schedule_c`), the scheduler seamlessly switches the `CR3` register and saves/restores floating-point/SSE state via `fxsave64`/`fxrstor64`.
-- **Demand Paging & Page Fault Exception Handling:** Integrated `#PF` (Page Fault, Exception 14) handling directly into the kernel exception stub. Userland heaps and stack growth trigger transparent on-demand page mapping (`vmm_handle_page_fault`).
-- **APIC Timer & IDT Alignment:** Configured Local APIC timer division and vector routing with dedicated interrupt service routines (ISRs) and interrupt stack tables (IST) for critical exceptions (Division Error, Invalid Opcode, Double Fault, General Protection Fault, and Page Fault).
+### 🔥 Core-Features & Architektur-Meilensteine
+* **Präemptives Multitasking:** Ein hardwarenaher Scheduler in `sched.c`, der Threads (wie den GUI-Compositor und die Netzwerk-Services) über den APIC-Timer-Interrupt (100 Hz Ticks) im fliegenden Wechsel synchronisiert.
+* **Windows Vista Aero GUI Framework:** Ein ultraschnelles 2D-Rendering-System im Ring 0/3 mit dynamischer Laufzeit-Skalierung (Resolution Switching). Berechnet mathematische Farbverläufe, Kanten-Radius-Spans und bitweises, divisionsfreies Parallel-Alpha-Blending direkt im Triple-Buffer-Backbuffer.
+* **Eigene Standard-Bibliothek (VeloLIBC):** Eine proprietäre, POSIX-ähnliche `libc`, die die Brücke zwischen hardwaregeschütztem Ring-3-Userland und dem Kernel über den modernen `syscall`/`sysret`-Mechanismus schlägt.
+* **Persistent Storage (AHCI & FAT32):** Eigene native Sektor-Treiber für SATA-Festplatten, die Partitionsdaten fehlerfrei über den AHCI-Controller einlesen und beschreiben.
+* **Netzwerk- & Krypto-Stack:** Ein integrierter Intel e1000 Gigabit-Netzwerktreiber mit DHCP-Lease und funktionierendem HTTPS/TLS-Handshake im Kernel für sichere, verschlüsselte Live-Abfragen.
+* **0-Delay CMOS RTC:** Sekundengenaue Hardware-Zeitsynchronisation direkt über die I/O-Ports des Mainboard-CMOS-Chips inklusive dynamischer Sommer-/Winterzeit-RAM-Lookup-Tabellen.
 
-### 3. Syscall Subsystem & ELF Application Loader (`syscall.c`)
-- **Isolated ELF64 Loader:** Enhanced `load_and_run_app` to parse ELF64 headers (`Elf64_Ehdr`, `Elf64_Phdr`, `Elf64_Shdr`) and perform dynamic relocation (`Elf64_Rela`) for text/data segments inside isolated virtual address spaces.
-- **Extended System Call API (`SYS_EXIT`, `SYS_EXEC_APP`, `SYS_KILL_TASK`, etc.):** 
-  - Added robust window handle tracking (`g_app_win_ids`) ensuring that when an application exits or is terminated via `SYS_KILL_TASK`, its GUI windows are automatically cleaned up.
-  - Implemented secure cross-port file copy, directory creation, file moving, and system power management (`SYS_SYSTEM_REBOOT`, `SYS_SYSTEM_SHUTDOWN`).
-  - Added network socket and HTTP asynchronous query support (`SYS_SOCKET_OPEN`, `SYS_HTTP_GET`, `SYS_DNS_RESOLVE`).
 
 ---
 
-## 📦 File Structure Snapshot (v12.3.0)
+## 📜 Rechtliche Hinweise & Urheberrecht (Copyright Protection)
 
-```text
-V12.3.0/
-├── apps/              # Graphical user applications (browser, explorer, notepad, sh, viper)
-├── bin/               # Core command-line utilities (cat, cp, ls, grep, ps, reboot, etc.)
-├── include/           # C standard library and VeloOS system headers
-├── libs/              # Embedded libraries (litehtml, cxx_runtime, etc.)
-├── kernel.c           # Core kernel initialization, GOP, TTY supervisor, event loop
-├── sched.c            # Multitasking scheduler, GDT/TSS, IDT, APIC timer, exception stubs
-├── syscall.c          # Ring 3 system call handler and secure ELF64 loader
-├── pmm_vmm.h          # Physical and virtual memory management declarations
-├── setup.h            # System configuration structures and setup state machine
-└── os.img / nvmedisk  # Bootable disk images and storage assets
+### ⚠️ STRENGER RECHTLICHER SCHUTZ – URHEBERRECHTSHINWEIS
+**Copyright © 2026 by Vantix (vntx-labs). Alle Rechte vorbehalten.**
+
+Dieses Betriebssystem-Repository, einschließlich aller Quellcodes (`.c`, `.h`), Assembler-Dateien, Skripte, Makefiles, Binärdaten und visuellen Assets (Vantix-Logo-Schwung, optimierte Ordner-Icons), unterliegt dem **strengen Schutz des internationalen Urheberrechts (Copyright Law)**.
+
+* **Keine unautorisierte Vervielfältigung (No Derivates / No Cloning):** Es ist strikt untersagt, den Code dieses Projekts zu kopieren, zu klonen, in eigene Repositories zu forken (außer zum Zweck von Pull Requests an dieses Upstream-Projekt), unter anderem Namen zu veröffentlichen oder Teile davon in andere Projekte einzubauen.
+* **Keine kommerzielle Nutzung:** Jegliche kommerzielle Verwertung, Nutzung in proprietären Systemen oder der Verkauf von Binär-Images (`.efi`, `.img`), die auf diesem Code basieren, ist illegal und wird rechtlich verfolgt.
+* **Anonymitätsschutz:** Die Identität des Kern-Entwicklers (**Vantix / vntx-labs**) ist im digitalen Raum vollständig isoliert und geschützt. Jegliche Versuche, diese Online-Identität mit realen Identitäten zu verknüpfen, verletzen die Privatsphäre und haben rechtliche Konsequenzen.
+
+### 🤝 Bestimmungen zur Mitarbeit (Contribution Policy)
+Wie in der beiliegenden `LICENSE` definiert, ist eine **Mitarbeit und Code-Kooperation ausdrücklich erlaubt und erwünscht**, solange sie unter folgenden Bedingungen stattfindet:
+
+1. **Pull Requests:** Code-Verbesserungen, Bugfixes (z. B. beim FAT32-Unterverzeichnis-Routing) und Feature-Erweiterungen müssen über offizielle Pull Requests eingereicht werden.
+2. **Rechteübertragung:** Mit dem Einreichen eines Pull Requests oder Beitrags stimmst du zu, dass dein bereitgestellter Code automatisch Teil des geschützten VeloOS-Ökosystems wird und den gleichen strengen Urheberrechtsbestimmungen von Vantix unterliegt.
+3. **Open-Source-Erhalt:** Das Projekt bleibt als kollaboratives Low-Level-Meisterwerk sichtbar, ist aber vor Diebstahl und unautorisierten Forks geschützt.
+
+---
+
+## 🛠️ Build & Ausführung (Host-Setup)
+
+Um VeloOS mit nativer Hardware-Geschwindigkeit und absolutem 0-Lag auf deinem Linux Mint-System zu emulieren, wird ein Prozessor-Passthrough benötigt.
+
+### Voraussetzungen
+```bash
+sudo apt update
+sudo apt install gcc binutils make mtools qemu-system-x86
 ```
 
----
+### Compilation & Start
+```bash
+make clean && make run
+```
+*Das Makefile baut automatisch die `velolibc.a`, kompiliert die Ring-3-Apps (`EXPLORER.BIN`) und startet QEMU mit aktivierter KVM-Hardwarebeschleunigung (`-cpu host`).*
 
-## ⚙️ Compilation & Installation
-
-To build and run VeloOS v12.3.0 from source:
-
-1. Ensure a modern cross-compiler toolchain (`x86_64-elf-gcc`, `ld`, `make`, `mtools`) is installed.
-2. Run the main build target from the root directory:
-   ```bash
-   make clean
-   make run
-   ```
-3. Test the image using QEMU with UEFI firmware (EDK2):
-   ```bash
-   qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.code.fd -drive file=os.img,format=raw -m 512M -net nic,model=e1000 -net user
-   ```
-
----
-*VeloOS Development Team — Release Documentation v12.3.0*

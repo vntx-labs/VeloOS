@@ -76,19 +76,6 @@ static inline void outb_io(unsigned short port, unsigned char val) {
     __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
 }
 
-static void kshell_drain_mouse(void) {
-    int max = 32;
-    while (--max) {
-        unsigned char stat = inb_kbc(0x64);
-        if (!(stat & 0x01)) break;
-        if (stat & 0x20) {
-            inb_kbc(0x60); // Maus-Byte verwerfen
-        } else {
-            break;         // Tastatur-Byte aufheben
-        }
-    }
-}
-
 static int k_strcmp(const char *s1, const char *s2) {
     if (!s1 || !s2) return -1;
     while (*s1 && (*s1 == *s2)) { s1++; s2++; }
@@ -316,16 +303,10 @@ void kshell_start(int tty_num) {
     int idx = tty_num - 1;
     KShellTTY *t = &g_kttys[idx];
 
-    // 1. Verwaiste Maus-Bytes abfangen
-    kshell_drain_mouse();
-
-    // 2. TTY NUR initialisieren, wenn sie noch NIE gestartet wurde!
-    // Bereits laufende Sessions bleiben 1:1 aktiv und eingeloggt!
     if (!t->initialized) {
         kshell_init_single_tty(idx);
     }
 
-    // 3. GOP direkt leeren und sofort synchronisieren
     clear_screen_graphics(0x000F172A);
     swap_buffers();
 
@@ -602,7 +583,6 @@ static int kshell_exec_disk_binary(int t_idx, const char *cmd_line) {
 static void kshell_exec_cmd(int t_idx, int tty_num, const char *cmd) {
     if (!cmd || !cmd[0]) return;
 
-    // Desktop wiederbeleben
     if (k_strstr(cmd, "run desktop") || k_strcmp(cmd, "desktop") == 0) {
         kterm_print(t_idx, "[+] Initialisiere Desktop GUI in TTY1...", 0x004ADE80);
         g_desktop_alive = 1;
@@ -614,9 +594,7 @@ static void kshell_exec_cmd(int t_idx, int tty_num, const char *cmd) {
         return;
     }
 
-    // Abmelden / Session beenden
     if (k_strcmp(cmd, "exit") == 0 || k_strcmp(cmd, "logout") == 0) {
-        KShellTTY *t = &g_kttys[t_idx];
         kernel_session_end(tty_num);
         kshell_init_single_tty(t_idx);
         g_kdirty = 1;
@@ -787,7 +765,6 @@ void kshell_handle_key(int tty_num, char key) {
 
                 if (check == 1) {
                     t->auth_ok = 1;
-                    // Session offiziell im Kernel registrieren
                     kernel_session_start(tty_num, t->user);
 
                     kterm_print(t_idx, "\n[+] Authentifizierung erfolgreich verifiziert (CONFIG.DAT).", 0x004ADE80);
@@ -923,8 +900,6 @@ void kshell_handle_key(int tty_num, char key) {
 }
 
 void kshell_tick_frame(int tty_num) {
-    kshell_drain_mouse();
-
     if (!g_kdirty) return;
     g_kdirty = 0;
 

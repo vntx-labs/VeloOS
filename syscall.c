@@ -230,16 +230,18 @@ UINT64 syscall_handler_c(UINT64 num, UINT64 a1, UINT64 a2, UINT64 a3, UINT64 a4)
                 return 1;
             }
 
-            if (cur_task >= 0 && task_pop_event(cur_task, ev)) {
-                return 1;
-            }
-
             WinEvent wev;
             if (wm_window_pop_event(win_id, &wev)) {
                 ev->type = wev.type;
                 ev->x = wev.x;
                 ev->y = wev.y;
                 ev->key = wev.key;
+                ev->scroll_x = wev.scroll_x;
+                ev->scroll_y = wev.scroll_y;
+                return 1;
+            }
+
+            if (cur_task >= 0 && task_pop_event(cur_task, ev)) {
                 return 1;
             }
             return 0;
@@ -692,37 +694,80 @@ void init_ring3_and_syscalls(void) {
     for (int i = 0; i < MAX_TASKS; i++) g_app_win_ids[i] = -1;
 }
 
+static int find_and_read_app(void *port, const char *filename) {
+    if (fat32_read_file(port, filename, g_app_buffer, sizeof(g_app_buffer)) > 0) return 1;
+
+    char path_buf[160];
+    const char *prefixes[] = {
+        "/", "/bin/", "/apps/", "/Programs/", "/Program Files/",
+        "C:/", "C:/bin/", "C:/apps/", "C:/Programs/", "C:/Program Files/"
+    };
+    int num_prefixes = (int)(sizeof(prefixes) / sizeof(prefixes[0]));
+    for (int i = 0; i < num_prefixes; i++) {
+        kstr_concat(path_buf, prefixes[i], filename, sizeof(path_buf));
+        if (fat32_read_file(port, path_buf, g_app_buffer, sizeof(g_app_buffer)) > 0) return 1;
+    }
+
+    /* Suche in Unterordnern von /apps und /Programs (z.B. /apps/browser/browser.bin) */
+    const char *parent_dirs[] = { "/apps", "C:/apps", "/Programs", "C:/Programs" };
+    int num_parents = (int)(sizeof(parent_dirs) / sizeof(parent_dirs[0]));
+    VeloDirEntry subdirs[32];
+    for (int p = 0; p < num_parents; p++) {
+        int count = fat32_list_dir(port, parent_dirs[p], subdirs, 32);
+        for (int d = 0; d < count; d++) {
+            if (subdirs[d].is_dir && subdirs[d].name[0] != '.') {
+                // 1. /apps/<subdir>/<filename>
+                int pos = 0;
+                const char *pd = parent_dirs[p];
+                while (*pd) path_buf[pos++] = *pd++;
+                path_buf[pos++] = '/';
+                const char *sd = subdirs[d].name;
+                while (*sd) path_buf[pos++] = *sd++;
+                path_buf[pos++] = '/';
+                const char *fn = filename;
+                while (*fn && pos < 159) path_buf[pos++] = *fn++;
+                path_buf[pos] = '\0';
+
+                if (fat32_read_file(port, path_buf, g_app_buffer, sizeof(g_app_buffer)) > 0) return 1;
+
+                // 2. /apps/<subdir>/<subdir>.bin
+                pos = 0;
+                pd = parent_dirs[p];
+                while (*pd) path_buf[pos++] = *pd++;
+                path_buf[pos++] = '/';
+                sd = subdirs[d].name;
+                while (*sd) path_buf[pos++] = *sd++;
+                path_buf[pos++] = '/';
+                sd = subdirs[d].name;
+                while (*sd && pos < 150) path_buf[pos++] = *sd++;
+                path_buf[pos++] = '.'; path_buf[pos++] = 'b'; path_buf[pos++] = 'i'; path_buf[pos++] = 'n';
+                path_buf[pos] = '\0';
+                if (fat32_read_file(port, path_buf, g_app_buffer, sizeof(g_app_buffer)) > 0) return 1;
+
+                path_buf[pos - 3] = 'B'; path_buf[pos - 2] = 'I'; path_buf[pos - 1] = 'N';
+                if (fat32_read_file(port, path_buf, g_app_buffer, sizeof(g_app_buffer)) > 0) return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 int load_and_run_app(const char *filename) {
     if (!filename) return 0;
     int port_count = ahci_get_port_count();
-    int bytes = -1;
+    int found = 0;
 
     for (int p = 0; p < port_count; p++) {
         AHCI_PORT_INFO *info = ahci_get_port_info(p);
         if (!info || !info->active || info->is_hidden) continue;
 
-        bytes = fat32_read_file(info->port_addr, filename, g_app_buffer, sizeof(g_app_buffer));
-        if (bytes > 0) break;
-
-        char path_buf[128];
-        kstr_concat(path_buf, "/", filename, sizeof(path_buf));
-        bytes = fat32_read_file(info->port_addr, path_buf, g_app_buffer, sizeof(g_app_buffer));
-        if (bytes > 0) break;
-
-        kstr_concat(path_buf, "/bin/", filename, sizeof(path_buf));
-        bytes = fat32_read_file(info->port_addr, path_buf, g_app_buffer, sizeof(g_app_buffer));
-        if (bytes > 0) break;
-
-        kstr_concat(path_buf, "/Programs/", filename, sizeof(path_buf));
-        bytes = fat32_read_file(info->port_addr, path_buf, g_app_buffer, sizeof(g_app_buffer));
-        if (bytes > 0) break;
-
-        kstr_concat(path_buf, "/Program Files/", filename, sizeof(path_buf));
-        bytes = fat32_read_file(info->port_addr, path_buf, g_app_buffer, sizeof(g_app_buffer));
-        if (bytes > 0) break;
+        if (find_and_read_app(info->port_addr, filename)) {
+            found = 1;
+            break;
+        }
     }
 
-    if (bytes <= 0) return 0;
+    if (!found) return 0;
 
     if (g_app_buffer[0] == 0x7F && g_app_buffer[1] == 'E' && 
         g_app_buffer[2] == 'L' && g_app_buffer[3] == 'F') {

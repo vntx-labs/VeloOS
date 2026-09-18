@@ -1,5 +1,4 @@
 CC      = gcc
-CXX     = g++
 LD      = ld
 OBJCOPY = objcopy
 STRIP   = strip
@@ -12,19 +11,8 @@ ARCH    = x86_64
 EFI_INCLUDE  = /usr/include/efi
 EFI_INC_ARCH = /usr/include/efi/$(ARCH)
 
-# Header fuer Velo-Apps (nutzen deine Mini-Libc)
+# Header fuer Ring-3 Velo-Apps (nutzen deine VeloLIBC)
 USER_INCLUDE = -I./include -I./include/libc -I./include/velo
-
-# Header fuer LiteHTML & Gumbo Parser
-LITEHTML_DIR = libs/litehtml
-LITEHTML_INCLUDES = -I./libs/litehtml/include \
-                    -I./libs/litehtml/include/litehtml \
-                    -I./libs/litehtml/src \
-                    -I./libs/litehtml/src/gumbo/include \
-                    -I./libs/litehtml/src/gumbo/include/gumbo \
-                    -I./include \
-                    -I./include/velo \
-                    -I./libs
 
 # ==========================================
 # KERNEL COMPILER-FLAGS (FREESTANDING / EFI)
@@ -53,7 +41,7 @@ CFLAGS = -I$(EFI_INCLUDE) \
          -O2
 
 # ==========================================
-# USERLAND APP COMPILER-FLAGS (C & C++)
+# USERLAND APP COMPILER-FLAGS (REINES C)
 # ==========================================
 USER_CFLAGS = $(USER_INCLUDE) \
               -fno-stack-protector \
@@ -65,14 +53,6 @@ USER_CFLAGS = $(USER_INCLUDE) \
               -Wall \
               -Wextra \
               -O2
-
-USER_CXXFLAGS = -fno-stack-protector \
-                -fPIE \
-                -mno-red-zone \
-                -march=x86-64 \
-                -std=c++17 \
-                -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
-                -O2
 
 USER_LDFLAGS = -nostartfiles -pie -Wl,-Bsymbolic -Wl,-z,max-page-size=4096 -Wl,-z,common-page-size=4096 -Wl,-e,_start
 
@@ -93,7 +73,8 @@ KERNEL_OBJS = kernel.o \
               syscall.o \
               sched.o \
               pmm_vmm.o \
-              kshell.o
+              kshell.o \
+              wallpaper.o
 
 LDFLAGS = -nostdlib \
           -znocombreloc \
@@ -106,21 +87,30 @@ LDFLAGS = -nostdlib \
           -lefi \
           -lgnuefi
 
-# ==========================================
-# QUELLEN FUER LITEHTML & BRIDGE (libs/)
-# ==========================================
-LITEHTML_C_SRCS   = $(wildcard $(LITEHTML_DIR)/src/gumbo/*.c)
-LITEHTML_CXX_SRCS = $(wildcard $(LITEHTML_DIR)/src/*.cpp) \
-                    libs/litehtml_bridge.cpp \
-                    libs/cxx_runtime.cpp
-
-LITEHTML_C_OBJS   = $(LITEHTML_C_SRCS:.c=.o)
-LITEHTML_CXX_OBJS = $(LITEHTML_CXX_SRCS:.cpp=.o)
-LITEHTML_OBJS     = $(LITEHTML_C_OBJS) $(LITEHTML_CXX_OBJS)
-
 .PHONY: all clean run reset-disk disk-reset apps bin_tools libc iso
 
 all: os.img
+
+# ==========================================
+# WALLPAPER CONVERSION & LINKING
+# ==========================================
+wallpaper.bin:
+	@if [ -f wallpaper.png ]; then \
+		echo "[+] Konvertiere wallpaper.png zu raw BGRA..."; \
+		python3 -c "from PIL import Image; img=Image.open('wallpaper.png').convert('RGBA'); r,g,b,a=img.split(); Image.merge('RGBA',(b,g,r,a)).save('wallpaper.bin')" 2>/dev/null || \
+		ffmpeg -y -i wallpaper.png -vcodec rawvideo -pix_fmt bgra wallpaper.bin >/dev/null 2>&1 || \
+		convert wallpaper.png -depth 8 bgra:wallpaper.bin >/dev/null 2>&1 || \
+		dd if=/dev/zero of=wallpaper.bin bs=1024 count=3072 status=none; \
+	else \
+		dd if=/dev/zero of=wallpaper.bin bs=1024 count=3072 status=none; \
+	fi
+
+wallpaper.o: wallpaper.bin
+	$(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --redefine-sym _binary_wallpaper_bin_start=g_wallpaper_start \
+	  --redefine-sym _binary_wallpaper_bin_end=g_wallpaper_end \
+	  --redefine-sym _binary_wallpaper_bin_size=g_wallpaper_size \
+	  wallpaper.bin wallpaper.o
 
 # ==========================================
 # KERNEL KOMPILIERUNG
@@ -156,26 +146,9 @@ libc/velolibc.o: libc/velolibc.c
 	$(CC) $(USER_CFLAGS) -c libc/velolibc.c -o libc/velolibc.o
 
 # ==========================================
-# LITEHTML ENGINE & BRIDGE (libs/) BAUEN
+# USERLAND APPS (apps/*) BAUEN
 # ==========================================
-libs/%.o: libs/%.cpp
-	$(CXX) $(USER_CXXFLAGS) $(LITEHTML_INCLUDES) -c $< -o $@
-
-$(LITEHTML_DIR)/src/gumbo/%.o: $(LITEHTML_DIR)/src/gumbo/%.c
-	$(CC) -fPIE -mno-red-zone -march=x86-64 -D_GNU_SOURCE -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -O2 $(LITEHTML_INCLUDES) -c $< -o $@
-
-$(LITEHTML_DIR)/src/%.o: $(LITEHTML_DIR)/src/%.cpp
-	$(CXX) $(USER_CXXFLAGS) $(LITEHTML_INCLUDES) -c $< -o $@
-
-lib/liblitehtml.a: $(LITEHTML_OBJS)
-	@mkdir -p lib
-	@echo "[+] Erstelle LiteHTML-Bibliothek: lib/liblitehtml.a"
-	$(AR) rcs $@ $^
-
-# ==========================================
-# USERLAND APPS (apps/) BAUEN
-# ==========================================
-apps: libc lib/liblitehtml.a
+apps: libc
 	@set -e; \
 	if [ -d apps ]; then \
 		for dir in apps/*; do \
@@ -190,11 +163,7 @@ apps: libc lib/liblitehtml.a
 						$(CC) $(USER_CFLAGS) -c "$$cs" -o "$$obj"; \
 						obj_files="$$obj_files $$obj"; \
 					done; \
-					if [ "$$name" = "BROWSER" ]; then \
-						$(CXX) $(USER_CXXFLAGS) $(USER_LDFLAGS) -nostdlib libc/velolibc.o $$obj_files lib/liblitehtml.a -lstdc++ -lm -lc -lgcc_s -lgcc -o "$$name.BIN"; \
-					else \
-						$(CC) $(USER_CFLAGS) $(USER_LDFLAGS) -nostdlib libc/velolibc.o $$obj_files -o "$$name.BIN"; \
-					fi; \
+					$(CC) $(USER_CFLAGS) $(USER_LDFLAGS) -nostdlib libc/velolibc.o $$obj_files -o "$$name.BIN"; \
 					$(STRIP) --strip-debug "$$name.BIN"; \
 					rm -f $$obj_files; \
 				fi; \
@@ -237,6 +206,7 @@ os.img: kernel.efi apps bin_tools
 	@mmd -D s -i os.img@@1M ::/EFI 2>/dev/null || true
 	@mmd -D s -i os.img@@1M ::/EFI/BOOT 2>/dev/null || true
 	@mmd -D s -i os.img@@1M ::/bin 2>/dev/null || true
+	@mmd -D s -i os.img@@1M ::/apps 2>/dev/null || true
 	@mmd -D s -i os.img@@1M ::/Programs 2>/dev/null || true
 	@mmd -D s -i os.img@@1M ::/Program\ Files 2>/dev/null || true
 	@mmd -D s -i os.img@@1M ::/VeloOS 2>/dev/null || true
@@ -258,8 +228,8 @@ os.img: kernel.efi apps bin_tools
 			fi; \
 		done; \
 	fi
-	@for app in BROWSER.BIN EXPLORER.BIN NOTEPAD.BIN SH.BIN; do \
-		if [ -f "$$app" ]; then \
+	@for app in *.BIN; do \
+		if [ -f "$$app" ] && [ "$$app" != "WALL.BIN" ]; then \
 			mcopy -o -i os.img@@1M "$$app" "::/$$app"; \
 			mcopy -o -i os.img@@1M "$$app" "::/bin/$$app"; \
 			mcopy -o -i os.img@@1M "$$app" "::/Programs/$$app"; \
@@ -270,6 +240,26 @@ os.img: kernel.efi apps bin_tools
 	@printf "Willkommen auf dem VeloOS Desktop!\n" > /tmp/velo_welcome.txt
 	@mcopy -o -i os.img@@1M /tmp/velo_welcome.txt "::/Users/Desktop/Willkommen.txt"
 	@rm -f /tmp/velo_readme.txt /tmp/velo_welcome.txt
+	@if [ -f nvmedisk.img ]; then \
+		echo "[+] Synchronisiere Binaries mit nvmedisk.img..."; \
+		mdel -i nvmedisk.img@@1M ::/EFI/BOOT/BOOTX64.EFI 2>/dev/null || true; \
+		mcopy -o -i nvmedisk.img@@1M kernel.efi ::/EFI/BOOT/BOOTX64.EFI 2>/dev/null || true; \
+		for app in *.BIN; do \
+			if [ -f "$$app" ] && [ "$$app" != "WALL.BIN" ]; then \
+				mcopy -o -i nvmedisk.img@@1M "$$app" "::/$$app" 2>/dev/null || true; \
+				mcopy -o -i nvmedisk.img@@1M "$$app" "::/bin/$$app" 2>/dev/null || true; \
+				mcopy -o -i nvmedisk.img@@1M "$$app" "::/Programs/$$app" 2>/dev/null || true; \
+			fi; \
+		done; \
+		if [ -d bin_out ]; then \
+			for b in bin_out/*.BIN; do \
+				if [ -f "$$b" ]; then \
+					fname=$$(basename "$$b"); \
+					mcopy -o -i nvmedisk.img@@1M "$$b" "::/bin/$$fname" 2>/dev/null || true; \
+				fi; \
+			done; \
+		fi; \
+	fi
 
 # ==========================================
 # ISO-BUILD TARGET (UEFI FAT32 ESP + VENTOY)
@@ -277,12 +267,13 @@ os.img: kernel.efi apps bin_tools
 iso: kernel.efi apps bin_tools
 	@rm -rf iso_root efiboot.img velo.iso
 	@mkdir -p iso_root/EFI/BOOT
-	@echo "[+] Erstelle 96 MB FAT32 EFI-System-Partition fuer echte Hardware..."
+	@echo "[+] Erstelle 96 MB FAT32 EFI-System-Partition..."
 	@dd if=/dev/zero of=efiboot.img bs=1M count=96 status=none
 	@mkfs.vfat -F 32 -n "VELO_BOOT" efiboot.img > /dev/null
 	@mmd -i efiboot.img ::/EFI 2>/dev/null || true
 	@mmd -i efiboot.img ::/EFI/BOOT 2>/dev/null || true
 	@mmd -i efiboot.img ::/bin 2>/dev/null || true
+	@mmd -i efiboot.img ::/apps 2>/dev/null || true
 	@mmd -i efiboot.img ::/Programs 2>/dev/null || true
 	@mmd -i efiboot.img ::/VeloOS 2>/dev/null || true
 	@mmd -i efiboot.img ::/VeloOS/System32 2>/dev/null || true
@@ -299,8 +290,8 @@ iso: kernel.efi apps bin_tools
 			fi; \
 		done; \
 	fi
-	@for app in BROWSER.BIN EXPLORER.BIN NOTEPAD.BIN SH.BIN; do \
-		if [ -f "$$app" ]; then \
+	@for app in *.BIN; do \
+		if [ -f "$$app" ] && [ "$$app" != "WALL.BIN" ]; then \
 			mcopy -o -i efiboot.img "$$app" "::/$$app"; \
 			mcopy -o -i efiboot.img "$$app" "::/bin/$$app"; \
 			mcopy -o -i efiboot.img "$$app" "::/Programs/$$app"; \
@@ -330,7 +321,7 @@ iso: kernel.efi apps bin_tools
 	@echo "========================================================="
 
 # ==========================================
-# EMULATION (QEMU)
+# EMULATION (QEMU MIT ECHTEM USB 3.0 xHCI + TABLET + TASTATUR)
 # ==========================================
 run: os.img
 	@if [ ! -f nvmedisk.img ]; then \
@@ -342,6 +333,8 @@ run: os.img
 	  -m 4096M \
 	  -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
 	  -machine q35 \
+	  -device qemu-xhci,id=xhci \
+	  -device usb-tablet,bus=xhci.0 \
 	  -drive file=os.img,format=raw,if=none,id=bootdisk \
 	  -device ide-hd,drive=bootdisk,bus=ide.0 \
 	  -drive file=nvmedisk.img,format=raw,if=none,id=nvme0 \
@@ -353,11 +346,10 @@ run: os.img
 
 disk-reset: reset-disk
 reset-disk:
-	rm -f os.img velo.img esp.img velo.iso nvmedisk.img efiboot.img
+	rm -f os.img velo.img esp.img velo.iso nvmedisk.img efiboot.img wallpaper.bin wallpaper.o
 	@echo "[+] Alle Festplattenabbilder wurden vollstaendig zurueckgesetzt."
 
 clean:
-	rm -f *.o *.so *.efi *.BIN libc/*.o lib/*.a esp.img efiboot.img velo.iso
-	rm -f libs/*.o libs/litehtml/src/*.o libs/litehtml/src/gumbo/*.o
+	rm -f *.o *.so *.efi *.BIN libc/*.o lib/*.a esp.img efiboot.img velo.iso wallpaper.bin wallpaper.o
 	rm -rf dist iso_root bin_out /tmp/litehtml_build
 	@echo "[+] Build-Dateien aufgeraeumt."

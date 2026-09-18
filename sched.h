@@ -82,7 +82,7 @@ int  task_get_count(void);
 Task* task_get_current(void);
 
 /* Prozess-spezifisches Input-Routing */
-void task_push_event(int task_id, int type, int x, int y, char key);
+void task_push_event(int task_id, int type, int x, int y, char key, int sx, int sy);
 int  task_pop_event(int task_id, UserEvent *out_ev);
 
 #endif /* SCHED_H */

@@ -31,7 +31,6 @@
 #define KEY_CTRL_Z    ((char)0x1A)
 
 void init_keyboard(void);
-void init_keyboard_bare_metal(void);
 void keyboard_drain(void);
 char poll_keyboard_ascii(void);
 void keyboard_set_layout(int layout);
@@ -44,4 +43,4 @@ int keyboard_is_alt(void);
 int keyboard_is_shift(void);
 int keyboard_is_delete(void);
 
-#endif
+#endif /* KEYBOARD_H */

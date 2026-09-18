@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstddef>
 using std::size_t;
+extern "C" {
 #else
 #include <string.h>
 #include <stdio.h>
@@ -17,6 +18,17 @@ using std::size_t;
 #endif
 
 typedef int velo_window_t;
+
+// ====================================================
+// ERWEITERTE KONTRAST-BERECHNUNG (ITU-R BT.709 LUMINANZ)
+// ====================================================
+static inline UINT32 velo_get_contrast_color(UINT32 bg_color) {
+    unsigned int r = (bg_color >> 16) & 0xFF;
+    unsigned int g = (bg_color >> 8) & 0xFF;
+    unsigned int b = bg_color & 0xFF;
+    unsigned int luminance = (r * 2126 + g * 7152 + b * 722) / 10000;
+    return (luminance >= 135) ? 0x000F172A : 0x00F8FAFC;
+}
 
 // ==========================================
 // BASIS-ZEICHEN-SYSCALLS (FENSTER)
@@ -56,6 +68,11 @@ static inline void velo_window_draw_text_colored(velo_window_t win, const char *
     velo_syscall(SYS_DRAW_TEXT_COL, (UINT64)win, (UINT64)text, (UINT64)x, ((UINT64)y << 32) | (UINT32)fg_col);
 }
 
+static inline void velo_window_draw_text_auto(velo_window_t win, const char *text, int x, int y, UINT32 bg_color) {
+    UINT32 contrast_fg = velo_get_contrast_color(bg_color);
+    velo_window_draw_text_colored(win, text, x, y, contrast_fg);
+}
+
 static inline void velo_window_draw_icon(velo_window_t win, int icon_type, int x, int y, int size) {
     UINT64 packed_pos = ((UINT64)(UINT32)x << 32) | (UINT32)y;
     velo_syscall(SYS_DRAW_ICON, (UINT64)win, (UINT64)icon_type, packed_pos, (UINT64)size);
@@ -85,11 +102,17 @@ static inline int velo_window_get_height(velo_window_t win) {
 }
 
 static inline int velo_ui_in_rect(int px, int py, int x, int y, int w, int h) {
-    return (px >= x && px <= x + w && py >= y && py <= y + h);
+    return (px >= x && px < x + w && py >= y && py < y + h);
 }
 
 // ====================================================
-// WINDOWS TEXT-CURSOR BERECHNUNG (KLICK AN MAUSPOSITION)
+// UNIVERSELLE TEXTBOX & CURSOR STEUERUNG
+// ====================================================
+int velo_ui_textbox_handle_key(char *text, int max_len, int *cursor_pos, char key);
+int velo_ui_textbox_handle_click(const char *text, int *cursor_pos, int click_x, int box_text_start_x, int char_w);
+
+// ====================================================
+// WINDOWS/macOS MEHRZEILEN-CURSOR BERECHNUNG (NOTEPAD)
 // ====================================================
 static inline int velo_text_calc_cursor(const char *text, int text_len, 
                                         int click_x, int click_y, 
@@ -132,9 +155,6 @@ static inline int velo_text_calc_cursor(const char *text, int text_len,
     return text_len;
 }
 
-// ====================================================
-// WINDOWS TEXT-NAVIGATION (PFEILTASTEN RAUF / RUNTER)
-// ====================================================
 static inline int velo_text_move_cursor_vertical(const char *text, int text_len, 
                                                  int cur_pos, int direction, 
                                                  int max_chars_per_line, int word_wrap) {
@@ -191,7 +211,7 @@ static inline int velo_text_move_cursor_vertical(const char *text, int text_len,
 }
 
 // ==========================================
-// DELEGIERTE UI WIDGET SYSCALLS
+// DELEGIERTE UI WIDGET SYSCALLS (macOS Glass Style)
 // ==========================================
 static inline void velo_ui_draw_button(velo_window_t win, int x, int y, int w, int h, const char *label, UINT32 top_col, UINT32 bot_col, UINT32 border_col, UINT32 text_col) {
     (void)top_col; (void)bot_col; (void)border_col; (void)text_col;
@@ -236,17 +256,19 @@ static inline void velo_ui_draw_modal_dialog(velo_window_t win, int x, int y, in
     UINT64 packed_dim = ((UINT64)(UINT32)w << 32) | (UINT32)h;
     velo_syscall(SYS_DRAW_DIALOG, (UINT64)win, packed_pos, packed_dim, (UINT64)title);
 
-    velo_window_draw_text_colored(win, prompt, x + 20, y + 44, 0x000F172A);
+    UINT32 dlg_bg = 0x001E293B;
+    UINT32 contrast_text = velo_get_contrast_color(dlg_bg);
+    velo_window_draw_text_colored(win, prompt, x + 20, y + 44, contrast_text);
 
     int in_x = x + 20, in_y = y + 68, in_w = w - 40;
-    velo_window_draw_gradient(win, in_x, in_y, in_w, 28, 0x00FFFFFF, 0x00F8FAFC);
-    velo_window_draw_rect_color(win, in_x, in_y, in_w, 1, 0x000284C7);
-    velo_window_draw_rect_color(win, in_x, in_y + 27, in_w, 1, 0x000284C7);
-    velo_window_draw_rect_color(win, in_x, in_y, 1, 28, 0x000284C7);
-    velo_window_draw_rect_color(win, in_x + in_w - 1, in_y, 1, 28, 0x000284C7);
+    velo_window_draw_gradient(win, in_x, in_y, in_w, 28, 0x001E293B, 0x000F172A);
+    velo_window_draw_rect_color(win, in_x, in_y, in_w, 1, 0x0038BDF8);
+    velo_window_draw_rect_color(win, in_x, in_y + 27, in_w, 1, 0x0038BDF8);
+    velo_window_draw_rect_color(win, in_x, in_y, 1, 28, 0x0038BDF8);
+    velo_window_draw_rect_color(win, in_x + in_w - 1, in_y, 1, 28, 0x0038BDF8);
 
-    velo_window_draw_text_colored(win, text_val, in_x + 8, in_y + 6, 0x000F172A);
-    velo_window_draw_rect_color(win, in_x + 8 + cursor_pos * 8, in_y + 5, 1, 16, 0x000284C7);
+    velo_window_draw_text_colored(win, text_val, in_x + 8, in_y + 6, 0x00FFFFFF);
+    velo_window_draw_rect_color(win, in_x + 8 + cursor_pos * 8, in_y + 5, 1, 16, 0x0038BDF8);
 
     int ok_x = x + w - 170, ok_y = y + h - 40;
     velo_ui_draw_button(win, ok_x, ok_y, 70, 26, btn_ok, 0, 0, 0, 0);
@@ -256,7 +278,7 @@ static inline void velo_ui_draw_modal_dialog(velo_window_t win, int x, int y, in
 }
 
 // ====================================================
-// ADVANCED GRAPHICAL FILE DIALOG (GFD) - CASE PRESERVING
+// ADVANCED GRAPHICAL FILE DIALOG (GFD - macOS Style)
 // ====================================================
 #define GFD_MODE_OPEN   1
 #define GFD_MODE_SAVE   2
@@ -355,12 +377,12 @@ static inline void velo_gfd_render(velo_window_t win, VeloFileDialog *dlg, int w
     int dlg_x = (w - dlg_w) / 2;
     int dlg_y = (h - dlg_h) / 2;
 
-    velo_window_draw_rect_color(win, dlg_x - 4, dlg_y - 4, dlg_w + 8, dlg_h + 8, 0x00334155);
-    velo_window_draw_gradient(win, dlg_x, dlg_y, dlg_w, dlg_h, 0x00FFFFFF, 0x00F8FAFC);
-    velo_window_draw_rect_color(win, dlg_x, dlg_y, dlg_w, 1, 0x000284C7);
-    velo_window_draw_rect_color(win, dlg_x, dlg_y + dlg_h - 1, dlg_w, 1, 0x0094A3B8);
+    velo_window_draw_rect_color(win, dlg_x - 4, dlg_y - 4, dlg_w + 8, dlg_h + 8, 0x000F172A);
+    velo_window_draw_gradient(win, dlg_x, dlg_y, dlg_w, dlg_h, 0x001E293B, 0x000F172A);
+    velo_window_draw_rect_color(win, dlg_x, dlg_y, dlg_w, 1, 0x0038BDF8);
+    velo_window_draw_rect_color(win, dlg_x, dlg_y + dlg_h - 1, dlg_w, 1, 0x00334155);
 
-    velo_window_draw_gradient(win, dlg_x, dlg_y, dlg_w, 30, 0x001B4D68, 0x000A2434);
+    velo_window_draw_gradient(win, dlg_x, dlg_y, dlg_w, 30, 0x000284C7, 0x000369A1);
     velo_window_draw_text_colored(win, (dlg->mode == GFD_MODE_OPEN) ? "Datei oeffnen" : "Speichern unter", dlg_x + 14, dlg_y + 7, 0x00FFFFFF);
 
     velo_ui_draw_button(win, dlg_x + 14, dlg_y + 36, 28, 24, "<", 0, 0, 0, 0);
@@ -368,23 +390,23 @@ static inline void velo_gfd_render(velo_window_t win, VeloFileDialog *dlg, int w
 
     int path_x = dlg_x + 48;
     int path_w = dlg_w - 174;
-    velo_window_draw_gradient(win, path_x, dlg_y + 36, path_w, 24, 0x00FFFFFF, 0x00F1F5F9);
-    velo_window_draw_rect_color(win, path_x, dlg_y + 36, path_w, 1, 0x00CBD5E1);
-    velo_window_draw_rect_color(win, path_x, dlg_y + 59, path_w, 1, 0x00CBD5E1);
-    velo_window_draw_rect_color(win, path_x, dlg_y + 36, 1, 24, 0x00CBD5E1);
-    velo_window_draw_rect_color(win, path_x + path_w - 1, dlg_y + 36, 1, 24, 0x00CBD5E1);
-    velo_window_draw_text_colored(win, dlg->current_path, path_x + 8, dlg_y + 40, 0x00334155);
+    velo_window_draw_gradient(win, path_x, dlg_y + 36, path_w, 24, 0x000F172A, 0x001E293B);
+    velo_window_draw_rect_color(win, path_x, dlg_y + 36, path_w, 1, 0x00334155);
+    velo_window_draw_rect_color(win, path_x, dlg_y + 59, path_w, 1, 0x00334155);
+    velo_window_draw_rect_color(win, path_x, dlg_y + 36, 1, 24, 0x00334155);
+    velo_window_draw_rect_color(win, path_x + path_w - 1, dlg_y + 36, 1, 24, 0x00334155);
+    velo_window_draw_text_colored(win, dlg->current_path, path_x + 8, dlg_y + 40, 0x0038BDF8);
 
     int list_x = dlg_x + 14;
     int list_y = dlg_y + 66;
     int list_w = dlg_w - 28;
     int list_h = 210;
 
-    velo_window_draw_rect_color(win, list_x, list_y, list_w, list_h, 0x00FFFFFF);
-    velo_window_draw_rect_color(win, list_x, list_y, list_w, 1, 0x00CBD5E1);
-    velo_window_draw_rect_color(win, list_x, list_y + list_h - 1, list_w, 1, 0x00CBD5E1);
-    velo_window_draw_rect_color(win, list_x, list_y, 1, list_h, 0x00CBD5E1);
-    velo_window_draw_rect_color(win, list_x + list_w - 1, list_y, 1, list_h, 0x00CBD5E1);
+    velo_window_draw_rect_color(win, list_x, list_y, list_w, list_h, 0x000F172A);
+    velo_window_draw_rect_color(win, list_x, list_y, list_w, 1, 0x00334155);
+    velo_window_draw_rect_color(win, list_x, list_y + list_h - 1, list_w, 1, 0x00334155);
+    velo_window_draw_rect_color(win, list_x, list_y, 1, list_h, 0x00334155);
+    velo_window_draw_rect_color(win, list_x + list_w - 1, list_y, 1, list_h, 0x00334155);
 
     int max_visible = 9;
     for (int i = 0; i < max_visible && (i + dlg->scroll_offset < dlg->entry_count); i++) {
@@ -392,8 +414,8 @@ static inline void velo_gfd_render(velo_window_t win, VeloFileDialog *dlg, int w
         int item_y = list_y + 4 + i * 22;
 
         if (idx == dlg->selected_idx) {
-            velo_window_draw_gradient(win, list_x + 2, item_y - 2, list_w - 20, 20, 0x00EBF4FB, 0x00CCE6FE);
-            velo_window_draw_rect_color(win, list_x + 2, item_y - 2, list_w - 20, 1, 0x0078B4E6);
+            velo_window_draw_gradient(win, list_x + 2, item_y - 2, list_w - 20, 20, 0x000284C7, 0x000369A1);
+            velo_window_draw_rect_color(win, list_x + 2, item_y - 2, list_w - 20, 1, 0x0038BDF8);
         }
 
         if (dlg->entries[idx].is_dir) {
@@ -409,26 +431,27 @@ static inline void velo_gfd_render(velo_window_t win, VeloFileDialog *dlg, int w
             if (dot) *dot = '\0';
         }
 
-        velo_window_draw_text_colored(win, display_name, list_x + 28, item_y + 2, 0x000F172A);
+        UINT32 item_fg = (idx == dlg->selected_idx) ? 0x00FFFFFF : velo_get_contrast_color(0x000F172A);
+        velo_window_draw_text_colored(win, display_name, list_x + 28, item_y + 2, item_fg);
     }
 
-    velo_window_draw_text_colored(win, "Dateiname:", dlg_x + 14, dlg_y + 288, 0x00475569);
+    velo_window_draw_text_colored(win, "Dateiname:", dlg_x + 14, dlg_y + 288, 0x0094A3B8);
     int in_x = dlg_x + 100, in_y = dlg_y + 284, in_w = dlg_w - 250;
-    velo_window_draw_gradient(win, in_x, in_y, in_w, 24, 0x00FFFFFF, 0x00F8FAFC);
-    velo_window_draw_rect_color(win, in_x, in_y, in_w, 1, 0x000284C7);
-    velo_window_draw_rect_color(win, in_x, in_y + 23, in_w, 1, 0x000284C7);
-    velo_window_draw_rect_color(win, in_x, in_y, 1, 24, 0x000284C7);
-    velo_window_draw_rect_color(win, in_x + in_w - 1, in_y, 1, 24, 0x000284C7);
-    velo_window_draw_text_colored(win, dlg->filename_input, in_x + 6, in_y + 4, 0x000F172A);
-    velo_window_draw_rect_color(win, in_x + 6 + dlg->cursor_pos * 8, in_y + 4, 1, 16, 0x000284C7);
+    velo_window_draw_gradient(win, in_x, in_y, in_w, 24, 0x000F172A, 0x001E293B);
+    velo_window_draw_rect_color(win, in_x, in_y, in_w, 1, 0x0038BDF8);
+    velo_window_draw_rect_color(win, in_x, in_y + 23, in_w, 1, 0x0038BDF8);
+    velo_window_draw_rect_color(win, in_x, in_y, 1, 24, 0x0038BDF8);
+    velo_window_draw_rect_color(win, in_x + in_w - 1, in_y, 1, 24, 0x0038BDF8);
+    velo_window_draw_text_colored(win, dlg->filename_input, in_x + 6, in_y + 4, 0x00FFFFFF);
+    velo_window_draw_rect_color(win, in_x + 6 + dlg->cursor_pos * 8, in_y + 4, 1, 16, 0x0038BDF8);
 
     int dd_x = in_x + in_w + 6, dd_w = 130;
-    velo_window_draw_gradient(win, dd_x, in_y, dd_w, 24, 0x00F8FAFC, 0x00E2E8F0);
-    velo_window_draw_rect_color(win, dd_x, in_y, dd_w, 1, 0x0094A3B8);
-    velo_window_draw_rect_color(win, dd_x, in_y + 23, dd_w, 1, 0x0094A3B8);
-    velo_window_draw_rect_color(win, dd_x, in_y, 1, 24, 0x0094A3B8);
-    velo_window_draw_rect_color(win, dd_x + dd_w - 1, in_y, 1, 24, 0x0094A3B8);
-    velo_window_draw_text_colored(win, (dlg->filter_type == 0) ? "*.txt" : "*.*", dd_x + 8, in_y + 4, 0x000F172A);
+    velo_window_draw_gradient(win, dd_x, in_y, dd_w, 24, 0x001E293B, 0x000F172A);
+    velo_window_draw_rect_color(win, dd_x, in_y, dd_w, 1, 0x00334155);
+    velo_window_draw_rect_color(win, dd_x, in_y + 23, dd_w, 1, 0x00334155);
+    velo_window_draw_rect_color(win, dd_x, in_y, 1, 24, 0x00334155);
+    velo_window_draw_rect_color(win, dd_x + dd_w - 1, in_y, 1, 24, 0x00334155);
+    velo_window_draw_text_colored(win, (dlg->filter_type == 0) ? "*.txt" : "*.*", dd_x + 8, in_y + 4, 0x00FFFFFF);
     velo_window_draw_text_colored(win, "v", dd_x + dd_w - 16, in_y + 4, 0x0064748B);
 
     int ok_x = dlg_x + dlg_w - 190;
@@ -442,18 +465,18 @@ static inline void velo_gfd_render(velo_window_t win, VeloFileDialog *dlg, int w
         int m_x = dlg_x + (dlg_w - m_w) / 2;
         int m_y = dlg_y + (dlg_h - m_h) / 2;
 
-        velo_window_draw_rect_color(win, m_x - 3, m_y - 3, m_w + 6, m_h + 6, 0x000F172A);
-        velo_window_draw_gradient(win, m_x, m_y, m_w, m_h, 0x00FFFFFF, 0x00F8FAFC);
-        velo_window_draw_rect_color(win, m_x, m_y, m_w, 1, 0x000284C7);
-        velo_window_draw_text_colored(win, "Neuen Ordner erstellen:", m_x + 14, m_y + 12, 0x000F172A);
+        velo_window_draw_rect_color(win, m_x - 3, m_y - 3, m_w + 6, m_h + 6, 0x00020617);
+        velo_window_draw_gradient(win, m_x, m_y, m_w, m_h, 0x001E293B, 0x000F172A);
+        velo_window_draw_rect_color(win, m_x, m_y, m_w, 1, 0x0038BDF8);
+        velo_window_draw_text_colored(win, "Neuen Ordner erstellen:", m_x + 14, m_y + 12, 0x00FFFFFF);
 
         int min_x = m_x + 14, min_y = m_y + 36, min_w = m_w - 28;
-        velo_window_draw_gradient(win, min_x, min_y, min_w, 24, 0x00FFFFFF, 0x00F1F5F9);
-        velo_window_draw_rect_color(win, min_x, min_y, min_w, 1, 0x000284C7);
-        velo_window_draw_rect_color(win, min_x, min_y + 23, min_w, 1, 0x000284C7);
-        velo_window_draw_rect_color(win, min_x, min_y, 1, 24, 0x000284C7);
-        velo_window_draw_rect_color(win, min_x + min_w - 1, min_y, 1, 24, 0x000284C7);
-        velo_window_draw_text_colored(win, dlg->mkdir_input, min_x + 6, min_y + 4, 0x000F172A);
+        velo_window_draw_gradient(win, min_x, min_y, min_w, 24, 0x000F172A, 0x001E293B);
+        velo_window_draw_rect_color(win, min_x, min_y, min_w, 1, 0x0038BDF8);
+        velo_window_draw_rect_color(win, min_x, min_y + 23, min_w, 1, 0x0038BDF8);
+        velo_window_draw_rect_color(win, min_x, min_y, 1, 24, 0x0038BDF8);
+        velo_window_draw_rect_color(win, min_x + min_w - 1, min_y, 1, 24, 0x0038BDF8);
+        velo_window_draw_text_colored(win, dlg->mkdir_input, min_x + 6, min_y + 4, 0x00FFFFFF);
 
         velo_ui_draw_button(win, m_x + m_w - 150, m_y + m_h - 36, 65, 24, "OK", 0, 0, 0, 0);
         velo_ui_draw_button(win, m_x + m_w - 75, m_y + m_h - 36, 65, 24, "Abbrechen", 0, 0, 0, 0);
@@ -502,7 +525,6 @@ static inline int velo_gfd_handle_click(VeloFileDialog *dlg, int w, int h, int c
         return GFD_ACTION_NONE;
     }
 
-    // Dropdown Klick (Filter umschalten)
     int in_x = dlg_x + 100, in_w = dlg_w - 250;
     int dd_x = in_x + in_w + 6, dd_w = 130;
     if (velo_ui_in_rect(click_x, click_y, dd_x, dlg_y + 284, dd_w, 24)) {
@@ -569,7 +591,7 @@ static inline int velo_gfd_handle_key(VeloFileDialog *dlg, char key) {
                 for (int i = dlg->mkdir_cursor - 1; i < l; i++) dlg->mkdir_input[i] = dlg->mkdir_input[i + 1];
                 dlg->mkdir_cursor--;
             }
-        } else if ((unsigned char)key >= 32 && strlen(dlg->mkdir_input) < 28) {
+        } else if ((unsigned char)key >= 32 && (unsigned char)key < 127 && strlen(dlg->mkdir_input) < 28) {
             int l = (int)strlen(dlg->mkdir_input);
             for (int i = l; i >= dlg->mkdir_cursor; i--) dlg->mkdir_input[i + 1] = dlg->mkdir_input[i];
             dlg->mkdir_input[dlg->mkdir_cursor] = key;
@@ -588,12 +610,12 @@ static inline int velo_gfd_handle_key(VeloFileDialog *dlg, char key) {
             for (int i = dlg->cursor_pos - 1; i < l; i++) dlg->filename_input[i] = dlg->filename_input[i + 1];
             dlg->cursor_pos--;
         }
-    } else if (key == (char)0x84) {
+    } else if (key == (char)0x84 || key == KEY_LEFT) {
         if (dlg->cursor_pos > 0) dlg->cursor_pos--;
-    } else if (key == (char)0x85) {
+    } else if (key == (char)0x85 || key == KEY_RIGHT) {
         int l = (int)strlen(dlg->filename_input);
         if (dlg->cursor_pos < l) dlg->cursor_pos++;
-    } else if ((unsigned char)key >= 32 && strlen(dlg->filename_input) < 60) {
+    } else if ((unsigned char)key >= 32 && (unsigned char)key < 127 && strlen(dlg->filename_input) < 60) {
         int l = (int)strlen(dlg->filename_input);
         for (int i = l; i >= dlg->cursor_pos; i--) dlg->filename_input[i + 1] = dlg->filename_input[i];
         dlg->filename_input[dlg->cursor_pos] = key;
@@ -602,4 +624,8 @@ static inline int velo_gfd_handle_key(VeloFileDialog *dlg, char key) {
     return GFD_ACTION_NONE;
 }
 
+#ifdef __cplusplus
+}
 #endif
+
+#endif /* _VELO_WINDOW_H */
