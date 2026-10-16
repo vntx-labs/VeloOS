@@ -1,8 +1,7 @@
 #ifndef KSHELL_H
 #define KSHELL_H
 
-#include <efi.h>
-#include <efilib.h>
+#include <stdint.h>
 
 void kshell_init(void);
 void kshell_start(int tty_num);

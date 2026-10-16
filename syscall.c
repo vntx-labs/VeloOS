@@ -1,3 +1,5 @@
+#include <stddef.h>
+#include <stdint.h>
 #include "syscall.h"
 #include "wm.h"
 #include "ahci.h"
@@ -8,6 +10,10 @@
 #include "net.h"
 #include "sched.h"
 #include "pmm_vmm.h"
+
+#ifndef NULL
+#define NULL ((void*)0)
+#endif
 
 extern UINTN gop_width;
 extern UINTN gop_height;
@@ -28,13 +34,16 @@ static inline void outw_io(unsigned short port, unsigned short val) {
 
 void swap_buffers(void);
 
+// In syscall.c
+
 #define APP_MAX_SIZE 2097152 // 2 MB pro App
 
+// 4K-Aligned und isoliert
 static UINT8 g_app_buffer[APP_MAX_SIZE] __attribute__((aligned(4096)));
 static UINT8 g_app_exec_memory[MAX_TASKS][APP_MAX_SIZE] __attribute__((aligned(4096)));
-static UINT8 g_user_heap[16777216] __attribute__((aligned(4096))); // 16 MB Userland Heap
+static UINT8 g_user_heap[8388608] __attribute__((aligned(4096))); // 8 MB User-Heap (stabilisiert BSS)
 static UINTN g_heap_offset = 0;
-static int g_app_win_ids[MAX_TASKS] = {0};
+int g_app_win_ids[MAX_TASKS] = {-1, -1, -1, -1, -1, -1, -1, -1};
 
 static inline void kstr_concat(char *dst, const char *prefix, const char *name, UINTN max_len) {
     UINTN pos = 0;
@@ -181,8 +190,23 @@ UINT64 syscall_handler_c(UINT64 num, UINT64 a1, UINT64 a2, UINT64 a3, UINT64 a4)
             const char *title = (const char *)a1;
             int w = (int)a2;
             int h = (int)a3;
+
+            // 1. Wenn dieser Task bereits ein aktives Fenster hat, wiederverwenden:
+            if (cur_task >= 1 && cur_task < MAX_TASKS) {
+                int existing_id = g_app_win_ids[cur_task];
+                if (existing_id >= 0 && existing_id < MAX_WINDOWS) {
+                    Window *ewin = wm_get_window(existing_id);
+                    if (ewin && !ewin->is_closed) {
+                        wm_focus_window(existing_id);
+                        return (UINT64)existing_id;
+                    }
+                }
+            }
+
             int win_id = wm_create_window_auto(title, w, h, NULL);
-            if (cur_task >= 0 && cur_task < MAX_TASKS) g_app_win_ids[cur_task] = win_id;
+            if (cur_task >= 1 && cur_task < MAX_TASKS) {
+                g_app_win_ids[cur_task] = win_id;
+            }
             wm_mark_all_dirty();
             return (UINT64)win_id;
         }
@@ -227,9 +251,13 @@ UINT64 syscall_handler_c(UINT64 num, UINT64 a1, UINT64 a2, UINT64 a3, UINT64 a4)
                 ev->type = VELO_EV_RESIZE;
                 ev->x = win->is_maximized ? win->width : win->width - 12;
                 ev->y = win->is_maximized ? win->height - 30 : win->height - 36;
+                ev->key = 0;
+                ev->scroll_x = 0;
+                ev->scroll_y = 0;
                 return 1;
             }
 
+            // 1. Zuerst aus der Fenster-Queue lesen
             WinEvent wev;
             if (wm_window_pop_event(win_id, &wev)) {
                 ev->type = wev.type;
@@ -241,9 +269,13 @@ UINT64 syscall_handler_c(UINT64 num, UINT64 a1, UINT64 a2, UINT64 a3, UINT64 a4)
                 return 1;
             }
 
-            if (cur_task >= 0 && task_pop_event(cur_task, ev)) {
-                return 1;
+            // 2. Falls leer, aus der Task-Queue lesen
+            if (cur_task >= 0 && cur_task < MAX_TASKS) {
+                if (task_pop_event(cur_task, ev)) {
+                    return 1;
+                }
             }
+
             return 0;
         }
 
@@ -610,6 +642,11 @@ UINT64 syscall_handler_c(UINT64 num, UINT64 a1, UINT64 a2, UINT64 a3, UINT64 a4)
 
         case SYS_KILL_TASK: {
             int pid = (int)a1;
+            if (pid == 0xEA) {
+                extern void intro_trigger_easter_egg(int return_tty);
+                intro_trigger_easter_egg(1);
+                return 0;
+            }
             if (pid <= 0) return (UINT64)-2;
 
             if (pid == 1) {
@@ -708,7 +745,6 @@ static int find_and_read_app(void *port, const char *filename) {
         if (fat32_read_file(port, path_buf, g_app_buffer, sizeof(g_app_buffer)) > 0) return 1;
     }
 
-    /* Suche in Unterordnern von /apps und /Programs (z.B. /apps/browser/browser.bin) */
     const char *parent_dirs[] = { "/apps", "C:/apps", "/Programs", "C:/Programs" };
     int num_parents = (int)(sizeof(parent_dirs) / sizeof(parent_dirs[0]));
     VeloDirEntry subdirs[32];
@@ -716,7 +752,6 @@ static int find_and_read_app(void *port, const char *filename) {
         int count = fat32_list_dir(port, parent_dirs[p], subdirs, 32);
         for (int d = 0; d < count; d++) {
             if (subdirs[d].is_dir && subdirs[d].name[0] != '.') {
-                // 1. /apps/<subdir>/<filename>
                 int pos = 0;
                 const char *pd = parent_dirs[p];
                 while (*pd) path_buf[pos++] = *pd++;
@@ -730,7 +765,6 @@ static int find_and_read_app(void *port, const char *filename) {
 
                 if (fat32_read_file(port, path_buf, g_app_buffer, sizeof(g_app_buffer)) > 0) return 1;
 
-                // 2. /apps/<subdir>/<subdir>.bin
                 pos = 0;
                 pd = parent_dirs[p];
                 while (*pd) path_buf[pos++] = *pd++;

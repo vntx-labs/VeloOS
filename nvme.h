@@ -1,8 +1,17 @@
 #ifndef NVME_H
 #define NVME_H
 
-#include <efi.h>
-#include <efilib.h>
+#include <stdint.h>
+
+#ifndef UINT32
+typedef uint8_t   UINT8;
+typedef uint16_t  UINT16;
+typedef uint32_t  UINT32;
+typedef uint64_t  UINT64;
+typedef int64_t   INT64;
+typedef uint64_t  UINTN;
+typedef void      VOID;
+#endif
 
 #define MAX_NVME_DEVICES 8
 

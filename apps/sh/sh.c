@@ -448,7 +448,17 @@ static int execute_single_command(char *cmd_line) {
         memset(g_line_lens, 0, sizeof(g_line_lens));
     } else if (strcmp(c, "exit") == 0) {
         exit(0);
-    } 
+    } else if (strcmp(c, "clear") == 0 || strcmp(c, "cls") == 0) {
+        g_line_count = 0;
+        g_scroll_offset = 0;
+        memset(g_term, 0, sizeof(g_term));
+        memset(g_line_lens, 0, sizeof(g_line_lens));
+    } else if (strcmp(c, "exit") == 0) {
+        exit(0);
+    } else if (strcmp(c, "eaegg") == 0 || strcmp(c, "supernatural") == 0) {
+        // TTY 8 Schatten-Hopp Trigger über Syscall
+        velo_syscall(SYS_KILL_TASK, 0xEA, 0, 0, 0); // Trigger-Signal an Kernel
+    }
     // 2. UNIX DISK DISPATCHER: Prioritaet C:/BIN und /bin
     else {
         velo_write_file("/VeloOS/System32/CMDLINE.DAT", cmd_line, (UINT32)strlen(cmd_line));

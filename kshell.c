@@ -1,3 +1,5 @@
+#include <stddef.h>
+#include <stdint.h>
 #include "kshell.h"
 #include "font.h"
 #include "ahci.h"
@@ -8,11 +10,15 @@
 #include "sched.h"
 #include "setup.h"
 #include "wm.h"
+#include "intro.h"
+
+#ifndef NULL
+#define NULL ((void*)0)
+#endif
 
 extern UINTN gop_width;
 extern UINTN gop_height;
 extern VOID* framebuffer_base;
-extern EFI_GRAPHICS_OUTPUT_PROTOCOL *gop;
 extern UINT32 *g_backbuffer;
 extern char g_user_name_active[32];
 extern char g_cpu_brand[49];
@@ -89,7 +95,8 @@ static void k_strcpy(char *dst, const char *src) {
 }
 
 static const char* k_strstr(const char *haystack, const char *needle) {
-    if (!haystack || !needle || !*needle) return haystack;
+    if (!haystack || !needle) return NULL;
+    if (!*needle) return haystack;
     for (const char *h = haystack; *h; h++) {
         const char *h_sub = h;
         const char *n = needle;
@@ -591,6 +598,11 @@ static void kshell_exec_cmd(int t_idx, int tty_num, const char *cmd) {
         g_current_tty = 1;
         wm_mark_all_dirty();
         g_kdirty = 1;
+        return;
+    }
+
+    if (k_strcmp(cmd, "eaegg") == 0 || k_strcmp(cmd, "supernatural") == 0) {
+        intro_trigger_easter_egg(tty_num);
         return;
     }
 

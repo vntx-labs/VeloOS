@@ -1,8 +1,7 @@
 #ifndef DESKTOP_H
 #define DESKTOP_H
 
-#include <efi.h>
-#include <efilib.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {

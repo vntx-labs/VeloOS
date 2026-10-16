@@ -1,3 +1,5 @@
+#include <stddef.h>
+#include <stdint.h>
 #include "setup.h"
 #include "font.h"
 #include "wm.h"
@@ -7,6 +9,10 @@
 #include "ahci.h"
 #include "fat32.h"
 #include "sched.h"
+
+#ifndef NULL
+#define NULL ((void*)0)
+#endif
 
 extern UINTN gop_width;
 extern UINTN gop_height;
@@ -60,20 +66,15 @@ static const char *g_timezones[NUM_TZ] = {
     "(UTC+09:00) Osaka, Sapporo, Tokio"
 };
 
-/* =========================================================================
- * DISK DETECTION: INSTALLATIONSMEDIUM AUSBLENDEN!
- * ========================================================================= */
 static void detect_disk_info(void) {
     g_disk_count = 0;
     int port_count = ahci_get_port_count();
     void *boot_port = ahci_get_boot_port();
 
-    // Nur Zielplatten auflisten; das Boot-Medium wird herausgefiltert!
     for (int p = 0; p < port_count && g_disk_count < MAX_DETECTED_DISKS; p++) {
         AHCI_PORT_INFO *info = ahci_get_port_info(p);
         if (!info || !info->active) continue;
 
-        // Wenn weitere Platten existieren, das Installationsmedium strikt ignorieren
         if (port_count > 1 && info->port_addr == boot_port) {
             continue;
         }
@@ -95,7 +96,6 @@ static void detect_disk_info(void) {
         g_disk_count++;
     }
 
-    // Fallback nur, falls wirklich nur ein einziges Testlaufwerk existiert
     if (g_disk_count == 0 && port_count > 0) {
         AHCI_PORT_INFO *info = ahci_get_port_info(0);
         g_disk_count = 1;
@@ -362,7 +362,6 @@ int load_system_config(SystemConfig *out_cfg) {
 
         if (bytes > 0 && out_cfg->magic[0] == 'V' && out_cfg->magic[1] == 'E' && out_cfg->setup_completed == 1) {
             ahci_set_primary_port(info->port_addr);
-            // Installationsmedium (Boot-Port) ausblenden, falls wir von Zielplatte booten
             if (ahci_get_boot_port() != info->port_addr) {
                 ahci_set_port_hidden(ahci_get_boot_port(), 1);
             }
@@ -372,13 +371,7 @@ int load_system_config(SystemConfig *out_cfg) {
     return 0;
 }
 
-/* =========================================================================
- * INSTALLATION AUF DIE AUSGEWÄHLTE PLATTE (NVMe / SSD)
- * ========================================================================= */
-/* =========================================================================
- * INSTALLATION AUF DIE AUSGEWÄHLTE PLATTE (NVMe / SSD)
- * ========================================================================= */
- static void run_setup_installation(void) {
+static void run_setup_installation(void) {
     g_step = 4;
     g_progress = 10;
     render_velo_setup();
@@ -387,15 +380,13 @@ int load_system_config(SystemConfig *out_cfg) {
     void *dst_port = g_disks[g_selected_disk].port_addr;
 
     if (dst_port != src_port && dst_port != NULL) {
-        // 1. Schneller 4KB-Block-Transfer des 64MB Systemabbilds
         UINT8 chunk[4096] __attribute__((aligned(4096)));
-        UINT32 total_copy_sectors = 131072; // 64 MB (enthält EFI, Apps & Verzeichnisse)
+        UINT32 total_copy_sectors = 131072;
 
         for (UINT32 sec = 0; sec < total_copy_sectors; sec += 8) {
             read_sata_sector(src_port, sec, 0, 8, chunk);
             write_sata_sector(dst_port, sec, 0, 8, chunk);
 
-            // Fortschrittsbalken flüssig von 10% bis 85% hochzählen
             int pct = 10 + (int)(((UINT64)sec * 75ULL) / total_copy_sectors);
             if (pct != g_progress && (sec % 4096 == 0)) {
                 g_progress = pct;
@@ -405,8 +396,6 @@ int load_system_config(SystemConfig *out_cfg) {
 
         g_progress = 85;
         render_velo_setup();
-
-        // 2. Dateisystem auf dem neuen Ziellaufwerk aktivieren
         fat32_init(dst_port);
 
         char welcome_msg[] = "Willkommen bei VeloOS auf Ihrem neuen Systemlaufwerk!\n";
@@ -415,7 +404,6 @@ int load_system_config(SystemConfig *out_cfg) {
         fat32_init(dst_port);
     }
 
-    // 3. Benutzerprofil & Konfiguration speichern
     if (g_u_len > 0) {
         int i = 0;
         while (g_username_input[i] && i < 31) {
@@ -427,7 +415,6 @@ int load_system_config(SystemConfig *out_cfg) {
 
     save_system_config_to_disk(dst_port);
 
-    // 4. Ziellaufwerk als primäres C:-Laufwerk setzen & Boot-Medium ausblenden
     ahci_set_primary_port(dst_port);
     if (dst_port != src_port) {
         ahci_set_port_hidden(src_port, 1);
@@ -454,9 +441,9 @@ void setup_init(void) {
     g_last_my = -1;
 
     detect_disk_info();
-    mouse_init();
     keyboard_set_layout(g_selected_lang);
     render_velo_setup();
+    swap_buffers();
 }
 
 void setup_disable(void) {

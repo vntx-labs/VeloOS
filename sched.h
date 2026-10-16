@@ -1,9 +1,18 @@
 #ifndef SCHED_H
 #define SCHED_H
 
-#include <efi.h>
-#include <efilib.h>
+#include <stdint.h>
 #include <velo/syscall.h>
+
+#ifndef UINT32
+typedef uint8_t   UINT8;
+typedef uint16_t  UINT16;
+typedef uint32_t  UINT32;
+typedef uint64_t  UINT64;
+typedef int64_t   INT64;
+typedef uint64_t  UINTN;
+typedef void      VOID;
+#endif
 
 #define MAX_TASKS 8
 #define TASK_STACK_SIZE 1048576 // 1 MB Stack pro Task

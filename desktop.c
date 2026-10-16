@@ -10,8 +10,9 @@
 #include "syscall.h"
 #include "sched.h"
 #include <velo/icons.h>
+#include <stddef.h>
+#include <stdint.h>
 
-extern EFI_SYSTEM_TABLE *g_st;
 extern UINTN gop_width;
 extern UINTN gop_height;
 extern UINT32 *g_backbuffer;
@@ -19,7 +20,6 @@ extern char g_user_name_active[32];
 extern UINT64 g_total_ram_mb;
 extern char g_cpu_brand[49];
 
-/* Aus wallpaper.o gelinkte Binärdaten */
 extern const char g_wallpaper_start[] __attribute__((weak));
 extern const char g_wallpaper_end[] __attribute__((weak));
 
@@ -142,9 +142,6 @@ static inline void outb_io(unsigned short port, unsigned char val) {
 }
 
 static void system_shutdown(void) {
-    if (RT && RT->ResetSystem) {
-        uefi_call_wrapper(RT->ResetSystem, 4, EfiResetShutdown, EFI_SUCCESS, 0, NULL);
-    }
     outw_io(0x604, 0x2000);
     outw_io(0xB004, 0x2000);
     outw_io(0x4004, 0x3400);
@@ -152,9 +149,6 @@ static void system_shutdown(void) {
 }
 
 static void system_reboot(void) {
-    if (RT && RT->ResetSystem) {
-        uefi_call_wrapper(RT->ResetSystem, 4, EfiResetCold, EFI_SUCCESS, 0, NULL);
-    }
     outb_io(0x64, 0xFE);
     outb_io(0xCF9, 0x06);
     while (1) { __asm__ volatile("cli; hlt"); }
@@ -616,20 +610,22 @@ static inline int boxes_intersect(int x1, int y1, int w1, int h1, int x2, int y2
     return !(x1 + w1 < x2 || x1 > x2 + w2 || y1 + h1 < y2 || y1 > y2 + h2);
 }
 
-#define PINNED_APP_COUNT 4
+#define PINNED_APP_COUNT 5
 
 static void get_dock_layout(int *out_x, int *out_y, int *out_w, int *out_h, int *out_open_cnt) {
     int open_cnt = 0;
     for (int i = 0; i < MAX_WINDOWS; i++) {
         Window *win = wm_get_window(i);
-        if (win && !win->is_closed) open_cnt++;
+        if (win && !win->is_closed && win->title[0] != '\0') {
+            open_cnt++;
+        }
     }
     if (out_open_cnt) *out_open_cnt = open_cnt;
 
     int dock_h = 58;
     int slot_w = 50;
     
-    int dock_w = 48 + (PINNED_APP_COUNT * slot_w) + (open_cnt > 0 ? (16 + open_cnt * slot_w) : 0) + 24;
+    int dock_w = 24 + (PINNED_APP_COUNT * slot_w) + (open_cnt > 0 ? (16 + open_cnt * slot_w) : 0);
     int dock_x = ((int)gop_width - dock_w) / 2;
     int dock_y = (int)gop_height - dock_h - 10;
 
@@ -693,6 +689,14 @@ static int is_grid_occupied(int check_col, int check_row, int total_icons) {
     return 0;
 }
 
+// In desktop.c:
+
+static int g_drag_threshold_passed = 0;
+static int g_last_click_time = 0;
+static int g_current_desktop_tick = 0;
+
+// In desktop.c:
+
 static void handle_mouse_events(void) {
     MouseState *m = mouse_get_state();
     int mx = m->x, my = m->y;
@@ -701,251 +705,18 @@ static void handle_mouse_events(void) {
     int dock_x, dock_y, dock_w, dock_h, open_apps;
     get_dock_layout(&dock_x, &dock_y, &dock_w, &dock_h, &open_apps);
 
+    // Cursor Typ
     if (in_box(mx, my, dock_x, dock_y, dock_w, dock_h) || my <= 24) {
         cursor = CURSOR_HAND;
     } else if (start_menu_open && in_box(mx, my, dock_x, dock_y - 410, 410, 400)) {
-        if (in_box(mx, my, dock_x + 12, dock_y - 48, 220, 26)) cursor = CURSOR_IBEAM;
+        if (in_box(mx, my, dock_x + 10, dock_y - 38, 220, 26)) cursor = CURSOR_IBEAM;
         else cursor = CURSOR_HAND;
     }
     mouse_set_cursor(cursor);
 
-    if (!m->left_button && wm_is_dragging()) wm_stop_drag();
-    if (wm_is_dragging()) { wm_update_drag(mx, my); return; }
-
-    /* Drag & Drop mit Kollisionsprüfung */
-    if (g_drag_active && (!m->left_button || m->left_released)) {
-        int delta_px_x = mx - g_drag_start_mx;
-        int delta_px_y = my - g_drag_start_my;
-
-        int delta_col = (delta_px_x >= 0) ? (delta_px_x + (DESKTOP_CELL_W / 2)) / (DESKTOP_CELL_W + 12)
-                                          : (delta_px_x - (DESKTOP_CELL_W / 2)) / (DESKTOP_CELL_W + 12);
-        int delta_row = (delta_px_y >= 0) ? (delta_px_y + (DESKTOP_CELL_H / 2)) / DESKTOP_CELL_H
-                                          : (delta_px_y - (DESKTOP_CELL_H / 2)) / DESKTOP_CELL_H;
-
-        int max_cols = ((int)gop_width - 40) / (DESKTOP_CELL_W + 12);
-        int max_rows = ((int)gop_height - 90) / DESKTOP_CELL_H;
-        int total_icons = 1 + g_desktop_file_count;
-
-        int collision_detected = 0;
-
-        for (int i = 0; i < total_icons; i++) {
-            if (g_selected_icons[i]) {
-                int nc = g_drag_origin_cols[i] + delta_col;
-                int nr = g_drag_origin_rows[i] + delta_row;
-
-                if (nc < 0 || nr < 0 || nc >= max_cols || nr >= max_rows || is_grid_occupied(nc, nr, total_icons)) {
-                    collision_detected = 1;
-                    break;
-                }
-            }
-        }
-
-        if (!collision_detected) {
-            for (int i = 0; i < total_icons; i++) {
-                if (g_selected_icons[i]) {
-                    g_icon_grid_col[i] = g_drag_origin_cols[i] + delta_col;
-                    g_icon_grid_row[i] = g_drag_origin_rows[i] + delta_row;
-                }
-            }
-            desktop_save_ini();
-        } else {
-            g_snapback_active = 1;
-            g_snapback_progress = 0;
-            for (int i = 0; i < total_icons; i++) {
-                if (g_selected_icons[i]) {
-                    int orig_x = 20 + g_drag_origin_cols[i] * (DESKTOP_CELL_W + 12);
-                    int orig_y = 34 + g_drag_origin_rows[i] * DESKTOP_CELL_H;
-                    g_snapback_from_x[i] = orig_x + delta_px_x;
-                    g_snapback_from_y[i] = orig_y + delta_px_y;
-                }
-            }
-        }
-
-        g_drag_active = 0;
-        wm_mark_all_dirty();
-        return;
-    } else if (g_drag_active && m->left_button) {
-        g_drag_cur_mx = mx;
-        g_drag_cur_my = my;
-        wm_mark_all_dirty();
-        return;
-    }
-
-    if (g_marquee_active && (!m->left_button || m->left_released)) {
-        g_marquee_active = 0;
-        wm_mark_all_dirty();
-    } else if (g_marquee_active && m->left_button) {
-        g_marquee_ex = mx;
-        g_marquee_ey = my;
-        update_marquee_selection();
-        wm_mark_all_dirty();
-        return;
-    }
-
-    if (m->scroll_z != 0 || m->scroll_h != 0) {
-        int target_win = -1;
-        int local_x = 0, local_y = 0;
-
-        for (int z = wm_get_z_count() - 1; z >= 0; z--) {
-            int wid = wm_get_z_window(z);
-            if (wid < 0) continue;
-            Window *w = wm_get_window(wid);
-            if (!w || w->is_closed || w->is_minimized) continue;
-
-            if (in_box(mx, my, w->x, w->y, w->width, w->height)) {
-                target_win = wid;
-                int off_x = w->is_maximized ? 0 : 6;
-                int off_y = 30;
-                local_x = mx - (w->x + off_x);
-                local_y = my - (w->y + off_y);
-                break;
-            }
-        }
-
-        if (target_win < 0) {
-            int act = wm_get_active_window_id();
-            if (act >= 0) {
-                Window *w = wm_get_window(act);
-                if (w && !w->is_closed && !w->is_minimized) {
-                    target_win = act;
-                    local_x = w->width / 2;
-                    local_y = w->height / 2;
-                }
-            }
-        }
-
-        if (target_win >= 0) {
-            wm_window_push_event(target_win, 5, local_x, local_y, 0, m->scroll_h, m->scroll_z);
-            task_push_event(target_win, 5, local_x, local_y, 0, m->scroll_h, m->scroll_z);
-        }
-
-        m->scroll_z = 0;
-        m->scroll_h = 0;
-    }
-
-    for (int z = wm_get_z_count() - 1; z >= 0; z--) {
-        int i = wm_get_z_window(z);
-        if (i < 0) continue;
-        Window *win = wm_get_window(i);
-        if (!win || win->is_closed || win->is_minimized) continue;
-
-        if (in_box(mx, my, win->x, win->y, win->width, win->height)) {
-            if (start_menu_open) {
-                start_menu_open = 0;
-                g_search_focused = 0;
-                wm_mark_all_dirty();
-            }
-
-            int btn_top = win->y + 5;
-            int btn_h = 20;
-
-            if (m->left_clicked && in_box(mx, my, win->x + win->width - 26, btn_top, 16, btn_h)) {
-                m->left_clicked = 0; wm_close_window(i); return;
-            } else if (m->left_clicked && in_box(mx, my, win->x + win->width - 46, btn_top, 16, btn_h)) {
-                m->left_clicked = 0; wm_maximize_window(i); return;
-            } else if (m->left_clicked && in_box(mx, my, win->x + win->width - 66, btn_top, 16, btn_h)) {
-                m->left_clicked = 0; wm_minimize_window_to(i, dock_x + dock_w / 2, dock_y); return;
-            }
-
-            if (m->left_clicked || m->right_clicked) wm_focus_window(i);
-
-            if (m->left_clicked && in_box(mx, my, win->x, win->y, win->width - 70, 30)) {
-                m->left_clicked = 0; wm_start_drag(i, mx, my); return;
-            }
-
-            int off_x = win->is_maximized ? 0 : 6;
-            int off_y = 30;
-            int local_x = mx - (win->x + off_x);
-            int local_y = my - (win->y + off_y);
-
-            if (m->left_clicked) {
-                m->left_clicked = 0;
-                wm_window_push_event(i, 1, local_x, local_y, 0, 0, 0);
-                task_push_event(i, 1, local_x, local_y, 0, 0, 0);
-            } else if (m->right_clicked) {
-                m->right_clicked = 0;
-                wm_window_push_event(i, 4, local_x, local_y, 0, 0, 0);
-                task_push_event(i, 4, local_x, local_y, 0, 0, 0);
-            }
-            return;
-        }
-    }
-
-    if (m->right_clicked && my > 24 && !in_box(mx, my, dock_x, dock_y, dock_w, dock_h)) {
-        m->right_clicked = 0;
-        start_menu_open = 0;
-        g_search_focused = 0;
-        g_ctx_menu_open = 1;
-        g_ctx_menu_x = (mx + CTX_MENU_W > (int)gop_width) ? (int)gop_width - CTX_MENU_W - 4 : mx;
-        g_ctx_menu_y = (my + CTX_MENU_H > (int)gop_height - 70) ? (int)gop_height - CTX_MENU_H - 70 : my;
-        wm_mark_all_dirty();
-        return;
-    }
-
-    if (!m->left_clicked && !m->left_button) return;
-
-    if (g_ctx_menu_open && m->left_clicked) {
-        m->left_clicked = 0;
-        if (in_box(mx, my, g_ctx_menu_x, g_ctx_menu_y, CTX_MENU_W, CTX_MENU_H)) {
-            int item_idx = (my - (g_ctx_menu_y + 6)) / 32;
-            g_ctx_menu_open = 0;
-            if (item_idx == 0) desktop_create_new_folder();
-            else if (item_idx == 1) desktop_create_new_file();
-            else if (item_idx == 2) desktop_reload_icons();
-            else if (item_idx == 3) launch_explorer_at_path("Computer");
-            wm_mark_all_dirty();
-            return;
-        }
-        g_ctx_menu_open = 0;
-        wm_mark_all_dirty();
-    }
-
-    if (in_box(mx, my, dock_x, dock_y, dock_w, dock_h) && m->left_clicked) {
-        m->left_clicked = 0;
-
-        int cur_x = dock_x + 12;
-
-        if (in_box(mx, my, cur_x, dock_y + 4, 44, 50)) { trigger_dock_bounce(0); launch_explorer_at_path("Computer"); return; }
-        cur_x += 50;
-
-        if (in_box(mx, my, cur_x, dock_y + 4, 44, 50)) { trigger_dock_bounce(1); task_spawn_app("BROWSER.BIN"); return; }
-        cur_x += 50;
-
-        if (in_box(mx, my, cur_x, dock_y + 4, 44, 50)) { trigger_dock_bounce(2); task_spawn_app("NOTEPAD.BIN"); return; }
-        cur_x += 50;
-
-        if (in_box(mx, my, cur_x, dock_y + 4, 44, 50)) { trigger_dock_bounce(3); task_spawn_app("SH.BIN"); return; }
-        cur_x += 50;
-
-        if (in_box(mx, my, cur_x, dock_y + 4, 44, 50)) {
-            trigger_dock_bounce(4);
-            start_menu_open = !start_menu_open;
-            start_menu_selected = 0;
-            g_search_focused = 0;
-            g_ctx_menu_open = 0;
-            if (start_menu_open) desktop_reload_program_apps();
-            wm_mark_all_dirty();
-            return;
-        }
-        cur_x += 50;
-
-        cur_x += 16;
-
-        for (int i = 0; i < MAX_WINDOWS; i++) {
-            Window *win = wm_get_window(i);
-            if (!win || win->is_closed) continue;
-
-            if (in_box(mx, my, cur_x, dock_y + 4, 44, 50)) {
-                if (win->is_minimized) wm_minimize_window_to(i, cur_x + 20, dock_y);
-                else if (win->is_active) wm_minimize_window_to(i, cur_x + 20, dock_y);
-                else wm_focus_window(i);
-                return;
-            }
-            cur_x += 50;
-        }
-        return;
-    }
-
+    // ----------------------------------------------------
+    // PRIORITÄT 1: STARTMENÜ
+    // ----------------------------------------------------
     if (start_menu_open && m->left_clicked) {
         int menu_w = 410, menu_h = 400;
         int menu_x = dock_x;
@@ -954,20 +725,10 @@ static void handle_mouse_events(void) {
         if (menu_x < 8) menu_x = 8;
 
         if (mx >= menu_x && mx <= menu_x + menu_w && my >= menu_y && my <= menu_y + menu_h) {
-            if (my >= menu_y + menu_h - 38 && mx >= menu_x + menu_w - 80) {
-                m->left_clicked = 0; system_shutdown(); return;
-            }
-            if (my >= menu_y + menu_h - 38 && mx >= menu_x + menu_w - 165 && mx < menu_x + menu_w - 80) {
-                m->left_clicked = 0; system_reboot(); return;
-            }
-
+            if (my >= menu_y + menu_h - 38 && mx >= menu_x + menu_w - 80) { m->left_clicked = 0; system_shutdown(); return; }
+            if (my >= menu_y + menu_h - 38 && mx >= menu_x + menu_w - 165 && mx < menu_x + menu_w - 80) { m->left_clicked = 0; system_reboot(); return; }
             if (mx >= menu_x + 10 && mx <= menu_x + 230 && my >= menu_y + menu_h - 38 && my <= menu_y + menu_h - 10) {
-                m->left_clicked = 0;
-                g_search_focused = 1;
-                wm_mark_all_dirty();
-                return;
-            } else {
-                g_search_focused = 0;
+                m->left_clicked = 0; g_search_focused = 1; wm_mark_all_dirty(); return;
             }
 
             int item_y = menu_y + 14;
@@ -984,22 +745,188 @@ static void handle_mouse_events(void) {
             }
 
             if (mx >= menu_x + 244 && mx <= menu_x + menu_w) {
-                if (my >= menu_y + 54 && my <= menu_y + 80) {
-                    m->left_clicked = 0; launch_explorer_at_path("C:/Users/Documents"); start_menu_open = 0; wm_mark_all_dirty(); return;
-                } else if (my >= menu_y + 82 && my <= menu_y + 108) {
-                    m->left_clicked = 0; launch_explorer_at_path("C:/Users/Pictures"); start_menu_open = 0; wm_mark_all_dirty(); return;
-                } else if (my >= menu_y + 110 && my <= menu_y + 136) {
-                    m->left_clicked = 0; launch_explorer_at_path("C:/Users/Downloads"); start_menu_open = 0; wm_mark_all_dirty(); return;
-                } else if (my >= menu_y + 138 && my <= menu_y + 164) {
-                    m->left_clicked = 0; launch_explorer_at_path("C:/Programs"); start_menu_open = 0; wm_mark_all_dirty(); return;
-                } else if (my >= menu_y + 166 && my <= menu_y + 192) {
-                    m->left_clicked = 0; launch_explorer_at_path("Computer"); start_menu_open = 0; wm_mark_all_dirty(); return;
-                }
+                if (my >= menu_y + 54 && my <= menu_y + 80) { m->left_clicked = 0; launch_explorer_at_path("C:/Users/Documents"); start_menu_open = 0; wm_mark_all_dirty(); return; }
+                else if (my >= menu_y + 82 && my <= menu_y + 108) { m->left_clicked = 0; launch_explorer_at_path("C:/Users/Pictures"); start_menu_open = 0; wm_mark_all_dirty(); return; }
+                else if (my >= menu_y + 110 && my <= menu_y + 136) { m->left_clicked = 0; launch_explorer_at_path("C:/Users/Downloads"); start_menu_open = 0; wm_mark_all_dirty(); return; }
+                else if (my >= menu_y + 138 && my <= menu_y + 164) { m->left_clicked = 0; launch_explorer_at_path("C:/Programs"); start_menu_open = 0; wm_mark_all_dirty(); return; }
+                else if (my >= menu_y + 166 && my <= menu_y + 192) { m->left_clicked = 0; launch_explorer_at_path("Computer"); start_menu_open = 0; wm_mark_all_dirty(); return; }
             }
             return;
         } else {
             m->left_clicked = 0; start_menu_open = 0; g_search_focused = 0; wm_mark_all_dirty();
         }
+    }
+
+    // ----------------------------------------------------
+    // PRIORITÄT 2: DOCK
+    // ----------------------------------------------------
+    if (in_box(mx, my, dock_x, dock_y, dock_w, dock_h) && m->left_clicked) {
+        m->left_clicked = 0;
+        int cur_x = dock_x + 12;
+
+        if (in_box(mx, my, cur_x, dock_y + 4, 44, 50)) { trigger_dock_bounce(0); launch_explorer_at_path("Computer"); return; }
+        cur_x += 50;
+        if (in_box(mx, my, cur_x, dock_y + 4, 44, 50)) { trigger_dock_bounce(1); task_spawn_app("BROWSER.BIN"); return; }
+        cur_x += 50;
+        if (in_box(mx, my, cur_x, dock_y + 4, 44, 50)) { trigger_dock_bounce(2); task_spawn_app("NOTEPAD.BIN"); return; }
+        cur_x += 50;
+        if (in_box(mx, my, cur_x, dock_y + 4, 44, 50)) { trigger_dock_bounce(3); task_spawn_app("SH.BIN"); return; }
+        cur_x += 50;
+
+        if (in_box(mx, my, cur_x, dock_y + 4, 44, 50)) {
+            trigger_dock_bounce(4);
+            start_menu_open = !start_menu_open;
+            start_menu_selected = 0;
+            g_search_focused = 1;
+            g_ctx_menu_open = 0;
+            if (start_menu_open) desktop_reload_program_apps();
+            wm_mark_all_dirty();
+            return;
+        }
+        cur_x += 50;
+        cur_x += 16;
+
+        for (int i = 0; i < MAX_WINDOWS; i++) {
+            Window *win = wm_get_window(i);
+            if (!win || win->is_closed || win->title[0] == '\0') continue;
+
+            if (in_box(mx, my, cur_x, dock_y + 4, 44, 50)) {
+                if (win->is_minimized) wm_minimize_window_to(i, cur_x + 20, dock_y);
+                else if (win->is_active) wm_minimize_window_to(i, cur_x + 20, dock_y);
+                else wm_focus_window(i);
+                return;
+            }
+            cur_x += 50;
+        }
+        return;
+    }
+
+    // ----------------------------------------------------
+    // PRIORITÄT 3: WINDOW MANAGER (ALLE FENSTER-EBENEN)
+    // ----------------------------------------------------
+    int l_click = m->left_clicked;
+    int r_click = m->right_clicked;
+    int sz = m->scroll_z;
+    int sh = m->scroll_h;
+
+    // Werte sofort zurücksetzen, damit sie nicht doppelt feuern
+    m->left_clicked = 0;
+    m->right_clicked = 0;
+    m->scroll_z = 0;
+    m->scroll_h = 0;
+
+    // Wenn der WM das Event für ein Fenster übernommen hat: FERTIG!
+    if (wm_handle_mouse(mx, my, l_click, r_click, sh, sz)) {
+        if (start_menu_open) {
+            start_menu_open = 0;
+            g_search_focused = 0;
+            wm_mark_all_dirty();
+        }
+        return;
+    }
+
+    // ----------------------------------------------------
+    // PRIORITÄT 4: DESKTOP-HINTERGRUND (NUR WENN KEIN FENSTER GETROFFEN WURDE)
+    // ----------------------------------------------------
+    if (g_drag_active) {
+        if (!m->left_button || m->left_released) {
+            if (g_drag_threshold_passed) {
+                int delta_px_x = mx - g_drag_start_mx;
+                int delta_px_y = my - g_drag_start_my;
+                int delta_col = (delta_px_x >= 0) ? (delta_px_x + (DESKTOP_CELL_W / 2)) / (DESKTOP_CELL_W + 12)
+                                                  : (delta_px_x - (DESKTOP_CELL_W / 2)) / (DESKTOP_CELL_W + 12);
+                int delta_row = (delta_px_y >= 0) ? (delta_px_y + (DESKTOP_CELL_H / 2)) / DESKTOP_CELL_H
+                                                  : (delta_px_y - (DESKTOP_CELL_H / 2)) / DESKTOP_CELL_H;
+
+                int max_cols = ((int)gop_width - 40) / (DESKTOP_CELL_W + 12);
+                int max_rows = ((int)gop_height - 90) / DESKTOP_CELL_H;
+                int total_icons = 1 + g_desktop_file_count;
+                int collision = 0;
+
+                for (int i = 0; i < total_icons; i++) {
+                    if (g_selected_icons[i]) {
+                        int nc = g_drag_origin_cols[i] + delta_col;
+                        int nr = g_drag_origin_rows[i] + delta_row;
+                        if (nc < 0 || nr < 0 || nc >= max_cols || nr >= max_rows || is_grid_occupied(nc, nr, total_icons)) {
+                            collision = 1; break;
+                        }
+                    }
+                }
+
+                if (!collision) {
+                    for (int i = 0; i < total_icons; i++) {
+                        if (g_selected_icons[i]) {
+                            g_icon_grid_col[i] = g_drag_origin_cols[i] + delta_col;
+                            g_icon_grid_row[i] = g_drag_origin_rows[i] + delta_row;
+                        }
+                    }
+                    desktop_save_ini();
+                } else {
+                    g_snapback_active = 1;
+                    g_snapback_progress = 0;
+                    for (int i = 0; i < total_icons; i++) {
+                        if (g_selected_icons[i]) {
+                            int orig_x = 20 + g_drag_origin_cols[i] * (DESKTOP_CELL_W + 12);
+                            int orig_y = 34 + g_drag_origin_rows[i] * DESKTOP_CELL_H;
+                            g_snapback_from_x[i] = orig_x + delta_px_x;
+                            g_snapback_from_y[i] = orig_y + delta_px_y;
+                        }
+                    }
+                }
+            }
+            g_drag_active = 0;
+            g_drag_threshold_passed = 0;
+            wm_mark_all_dirty();
+            return;
+        } else {
+            int dx = mx - g_drag_start_mx; if (dx < 0) dx = -dx;
+            int dy = my - g_drag_start_my; if (dy < 0) dy = -dy;
+            if (dx > 6 || dy > 6) g_drag_threshold_passed = 1;
+            g_drag_cur_mx = mx;
+            g_drag_cur_my = my;
+            wm_mark_all_dirty();
+            return;
+        }
+    }
+
+    if (g_marquee_active) {
+        if (!m->left_button || m->left_released) {
+            g_marquee_active = 0;
+            wm_mark_all_dirty();
+        } else {
+            g_marquee_ex = mx;
+            g_marquee_ey = my;
+            update_marquee_selection();
+            wm_mark_all_dirty();
+            return;
+        }
+    }
+
+    if (r_click && my > 24) {
+        start_menu_open = 0;
+        g_search_focused = 0;
+        g_ctx_menu_open = 1;
+        g_ctx_menu_x = (mx + CTX_MENU_W > (int)gop_width) ? (int)gop_width - CTX_MENU_W - 4 : mx;
+        g_ctx_menu_y = (my + CTX_MENU_H > (int)gop_height - 70) ? (int)gop_height - CTX_MENU_H - 70 : my;
+        wm_mark_all_dirty();
+        return;
+    }
+
+    if (!l_click) return;
+
+    if (g_ctx_menu_open) {
+        if (in_box(mx, my, g_ctx_menu_x, g_ctx_menu_y, CTX_MENU_W, CTX_MENU_H)) {
+            int item_idx = (my - (g_ctx_menu_y + 6)) / 32;
+            g_ctx_menu_open = 0;
+            if (item_idx == 0) desktop_create_new_folder();
+            else if (item_idx == 1) desktop_create_new_file();
+            else if (item_idx == 2) desktop_reload_icons();
+            else if (item_idx == 3) launch_explorer_at_path("Computer");
+            wm_mark_all_dirty();
+            return;
+        }
+        g_ctx_menu_open = 0;
+        wm_mark_all_dirty();
     }
 
     int total_icons = 1 + g_desktop_file_count;
@@ -1018,40 +945,42 @@ static void handle_mouse_events(void) {
     }
 
     if (clicked_icon >= 0) {
-        if (m->left_clicked) {
-            m->left_clicked = 0;
-            int is_shift = keyboard_is_shift();
+        int is_shift = keyboard_is_shift();
 
-            if (is_shift) {
-                g_selected_icons[clicked_icon] = !g_selected_icons[clicked_icon];
-            } else {
-                if (g_selected_icons[clicked_icon] && g_last_click_icon == clicked_icon) {
-                    open_desktop_item(clicked_icon);
-                    g_last_click_icon = -1;
-                    wm_mark_all_dirty();
-                    return;
-                }
-                if (!g_selected_icons[clicked_icon]) {
-                    for (int k = 0; k <= MAX_DESKTOP_ICONS; k++) g_selected_icons[k] = 0;
-                    g_selected_icons[clicked_icon] = 1;
-                }
-            }
-            g_last_click_icon = clicked_icon;
-
-            g_drag_active = 1;
-            g_drag_start_mx = mx;
-            g_drag_start_my = my;
-            g_drag_cur_mx = mx;
-            g_drag_cur_my = my;
-
-            for (int k = 0; k < total_icons; k++) {
-                g_drag_origin_cols[k] = g_icon_grid_col[k];
-                g_drag_origin_rows[k] = g_icon_grid_row[k];
-            }
-
+        if (g_last_click_icon == clicked_icon && (g_current_desktop_tick - g_last_click_time) < 45) {
+            g_last_click_icon = -1;
+            g_drag_active = 0;
+            open_desktop_item(clicked_icon);
             wm_mark_all_dirty();
+            return;
         }
-    } else if (m->left_clicked) {
+
+        g_last_click_icon = clicked_icon;
+        g_last_click_time = g_current_desktop_tick;
+
+        if (is_shift) {
+            g_selected_icons[clicked_icon] = !g_selected_icons[clicked_icon];
+        } else {
+            if (!g_selected_icons[clicked_icon]) {
+                for (int k = 0; k <= MAX_DESKTOP_ICONS; k++) g_selected_icons[k] = 0;
+                g_selected_icons[clicked_icon] = 1;
+            }
+        }
+
+        g_drag_active = 1;
+        g_drag_threshold_passed = 0;
+        g_drag_start_mx = mx;
+        g_drag_start_my = my;
+        g_drag_cur_mx = mx;
+        g_drag_cur_my = my;
+
+        for (int k = 0; k < total_icons; k++) {
+            g_drag_origin_cols[k] = g_icon_grid_col[k];
+            g_drag_origin_rows[k] = g_icon_grid_row[k];
+        }
+
+        wm_mark_all_dirty();
+    } else {
         if (!keyboard_is_shift()) {
             for (int k = 0; k <= MAX_DESKTOP_ICONS; k++) g_selected_icons[k] = 0;
         }
@@ -1133,6 +1062,7 @@ void desktop_tick_frame(void) {
     MouseState *m = mouse_get_state();
 
     int anim_active = wm_tick_animations();
+    g_current_desktop_tick++;
 
     if (g_dock_bounce_tick > 0) {
         g_dock_bounce_tick--;
@@ -1166,10 +1096,10 @@ void desktop_tick_frame(void) {
 
     if (!wm_is_dirty()) return;
 
-    // 1. Hintergrund zeichnen
+    clear_screen_graphics(0x000F172A);
+
     render_desktop_background();
 
-    // 2. Desktop-Grid mit Desktop-Icons
     int total_icons = 1 + g_desktop_file_count;
 
     for (int i = 0; i < total_icons; i++) {
@@ -1220,7 +1150,6 @@ void desktop_tick_frame(void) {
         wm_draw_text_shadow(formatted_name, tx, iy + 48, 1, text_col, shadow_col);
     }
 
-    // 3. ECHTE MULTI-DRAG & ELASTISCHE SNAP-BACK ANIMATION
     if (g_drag_active || g_snapback_active) {
         int delta_px_x = g_drag_cur_mx - g_drag_start_mx;
         int delta_px_y = g_drag_cur_my - g_drag_start_my;
@@ -1259,14 +1188,13 @@ void desktop_tick_frame(void) {
         }
     }
 
-    // 4. Alle Fenster rendern
     wm_render_all();
 
-    // 5. Menüleiste oben
     draw_frosted_glass_rect(0, 0, (int)gop_width, 24, 0, 0x001E293B, 180);
     draw_filled_rect(0, 23, gop_width, 1, 0x00334155);
 
-    wm_draw_text("VeloOS", 14, 4, 0x0038BDF8, 0x00000000);
+    draw_velo_startorb(16, 12, 8);
+    wm_draw_text("VeloOS", 30, 4, 0x0038BDF8, 0x00000000);
     
     int act_id = wm_get_active_window_id();
     if (act_id >= 0) {
@@ -1311,7 +1239,6 @@ void desktop_tick_frame(void) {
     draw_rounded_rect_aa(pill_x, 2, pill_w, 20, 10, 0x00334155);
     wm_draw_text(date_time_str, pill_x + 10, 4, 0x00CBD5E1, 0x00000000);
 
-    // 6. Großes schwebendes Dock unten mit hüpfenden Icons (macOS Bounce)
     int dock_x, dock_y, dock_w, dock_h, open_apps;
     get_dock_layout(&dock_x, &dock_y, &dock_w, &dock_h, &open_apps);
 
@@ -1325,10 +1252,10 @@ void desktop_tick_frame(void) {
     int slot_size0 = 40 + mag0;
     int slot_y0 = dock_y + (dock_h - slot_size0) / 2 - (mag0 / 2) + bnc0;
 
-    draw_rounded_rect_gradient(cur_slot_x - mag0 / 2, slot_y0, slot_size0, slot_size0, 12 + mag0 / 2, start_menu_open ? 0x000284C7 : 0x001E293B, 0x000F172A);
-    draw_rounded_rect_aa(cur_slot_x - mag0 / 2, slot_y0, slot_size0, slot_size0, 12 + mag0 / 2, start_menu_open ? 0x0038BDF8 : 0x00334155);
-    render_svg_app(cur_slot_x + 8 - mag0 / 4, slot_y0 + 8, 24 + mag0, desktop_icon_set_pixel);
-    cur_slot_x += 48;
+    draw_rounded_rect_gradient(cur_slot_x - mag0 / 2, slot_y0, slot_size0, slot_size0, 12 + mag0 / 2, 0x001E293B, 0x000F172A);
+    draw_rounded_rect_aa(cur_slot_x - mag0 / 2, slot_y0, slot_size0, slot_size0, 12 + mag0 / 2, 0x00334155);
+    render_icon_pc_32(cur_slot_x + 8 - mag0 / 4, slot_y0 + 8, desktop_icon_set_pixel);
+    cur_slot_x += 50;
 
     int mag1 = get_dock_icon_magnification(cur_slot_x + 20, m->x, m->y, dock_y, dock_h);
     int bnc1 = get_dock_bounce_offset(1);
@@ -1338,7 +1265,7 @@ void desktop_tick_frame(void) {
     draw_rounded_rect_gradient(cur_slot_x - mag1 / 2, slot_y1, slot_size1, slot_size1, 12 + mag1 / 2, 0x001E293B, 0x000F172A);
     draw_rounded_rect_aa(cur_slot_x - mag1 / 2, slot_y1, slot_size1, slot_size1, 12 + mag1 / 2, 0x00334155);
     render_svg_folder(cur_slot_x + 8 - mag1 / 4, slot_y1 + 8, 24 + mag1, desktop_icon_set_pixel);
-    cur_slot_x += 48;
+    cur_slot_x += 50;
 
     int mag2 = get_dock_icon_magnification(cur_slot_x + 20, m->x, m->y, dock_y, dock_h);
     int bnc2 = get_dock_bounce_offset(2);
@@ -1348,7 +1275,7 @@ void desktop_tick_frame(void) {
     draw_rounded_rect_gradient(cur_slot_x - mag2 / 2, slot_y2, slot_size2, slot_size2, 12 + mag2 / 2, 0x001E293B, 0x000F172A);
     draw_rounded_rect_aa(cur_slot_x - mag2 / 2, slot_y2, slot_size2, slot_size2, 12 + mag2 / 2, 0x00334155);
     render_svg_app(cur_slot_x + 8 - mag2 / 4, slot_y2 + 8, 24 + mag2, desktop_icon_set_pixel);
-    cur_slot_x += 48;
+    cur_slot_x += 50;
 
     int mag3 = get_dock_icon_magnification(cur_slot_x + 20, m->x, m->y, dock_y, dock_h);
     int bnc3 = get_dock_bounce_offset(3);
@@ -1358,17 +1285,19 @@ void desktop_tick_frame(void) {
     draw_rounded_rect_gradient(cur_slot_x - mag3 / 2, slot_y3, slot_size3, slot_size3, 12 + mag3 / 2, 0x001E293B, 0x000F172A);
     draw_rounded_rect_aa(cur_slot_x - mag3 / 2, slot_y3, slot_size3, slot_size3, 12 + mag3 / 2, 0x00334155);
     render_svg_doc(cur_slot_x + 8 - mag3 / 4, slot_y3 + 8, 24 + mag3, desktop_icon_set_pixel);
-    cur_slot_x += 48;
+    cur_slot_x += 50;
 
     int mag4 = get_dock_icon_magnification(cur_slot_x + 20, m->x, m->y, dock_y, dock_h);
     int bnc4 = get_dock_bounce_offset(4);
     int slot_size4 = 40 + mag4;
     int slot_y4 = dock_y + (dock_h - slot_size4) / 2 - (mag4 / 2) + bnc4;
 
-    draw_rounded_rect_gradient(cur_slot_x - mag4 / 2, slot_y4, slot_size4, slot_size4, 12 + mag4 / 2, 0x001E293B, 0x000F172A);
-    draw_rounded_rect_aa(cur_slot_x - mag4 / 2, slot_y4, slot_size4, slot_size4, 12 + mag4 / 2, 0x00334155);
-    render_svg_app(cur_slot_x + 8 - mag4 / 4, slot_y4 + 8, 24 + mag4, desktop_icon_set_pixel);
-    cur_slot_x += 48;
+    draw_rounded_rect_gradient(cur_slot_x - mag4 / 2, slot_y4, slot_size4, slot_size4, 12 + mag4 / 2, start_menu_open ? 0x000284C7 : 0x001E293B, 0x000F172A);
+    draw_rounded_rect_aa(cur_slot_x - mag4 / 2, slot_y4, slot_size4, slot_size4, 12 + mag4 / 2, start_menu_open ? 0x0038BDF8 : 0x00334155);
+    
+    // Unser echter VeloOS Startorb im Dock!
+    draw_velo_startorb(cur_slot_x + 20, slot_y4 + slot_size4 / 2, 14 + mag4 / 3);
+    cur_slot_x += 50;
 
     if (open_apps > 0) {
         draw_filled_rect((UINTN)(cur_slot_x + 6), (UINTN)(dock_y + 12), 1, (UINTN)(dock_h - 24), 0x00334155);
@@ -1376,7 +1305,7 @@ void desktop_tick_frame(void) {
 
         for (int i = 0; i < MAX_WINDOWS; i++) {
             Window *win = wm_get_window(i);
-            if (!win || win->is_closed) continue;
+            if (!win || win->is_closed || win->title[0] == '\0') continue;
 
             int is_act = win->is_active && !win->is_minimized;
             int magW = get_dock_icon_magnification(cur_slot_x + 20, m->x, m->y, dock_y, dock_h);
@@ -1397,11 +1326,10 @@ void desktop_tick_frame(void) {
                 }
             }
 
-            cur_slot_x += 48;
+            cur_slot_x += 50;
         }
     }
 
-    // 7. Gummiband-Auswahlrechteck
     if (g_marquee_active) {
         int x1 = (g_marquee_sx < g_marquee_ex) ? g_marquee_sx : g_marquee_ex;
         int x2 = (g_marquee_sx < g_marquee_ex) ? g_marquee_ex : g_marquee_sx;
@@ -1430,7 +1358,6 @@ void desktop_tick_frame(void) {
         }
     }
 
-    // 8. Start-Popup
     if (start_menu_open) {
         int menu_w = 410, menu_h = 400;
         int menu_x = dock_x;
@@ -1499,7 +1426,6 @@ void desktop_tick_frame(void) {
         wm_draw_text("Power", menu_x + menu_w - 68, menu_y + menu_h - 30, 0x00FFFFFF, 0x00000000);
     }
 
-    // 9. Kontextmenü
     if (g_ctx_menu_open) {
         int cx = g_ctx_menu_x, cy = g_ctx_menu_y;
         draw_rounded_rect_aa(cx + 2, cy + 2, CTX_MENU_W, CTX_MENU_H, 6, 0x00020617);
@@ -1525,61 +1451,85 @@ void desktop_tick_frame(void) {
 }
 
 void desktop_handle_key(char c) {
+    g_current_desktop_tick++;
+
+    // Super / F1: Startmenü umschalten
     if (c == KEY_SUPER || c == KEY_F1) {
         start_menu_open = !start_menu_open;
         start_menu_selected = 0;
-        g_search_focused = 0;
+        g_search_focused = start_menu_open ? 1 : 0;
         g_ctx_menu_open = 0;
         if (start_menu_open) desktop_reload_program_apps();
         wm_mark_all_dirty();
         return;
     }
+
     if (g_ctx_menu_open && c == KEY_ESC) {
-        g_ctx_menu_open = 0; wm_mark_all_dirty(); return;
+        g_ctx_menu_open = 0;
+        wm_mark_all_dirty();
+        return;
     }
 
+    // ----------------------------------------------------
+    // STARTMENÜ & SPOTLIGHT SUCHE
+    // ----------------------------------------------------
     if (start_menu_open) {
         if (c == KEY_ESC) {
-            start_menu_open = 0; g_search_focused = 0; wm_mark_all_dirty(); return;
+            start_menu_open = 0;
+            g_search_focused = 0;
+            wm_mark_all_dirty();
+            return;
         }
-        if (g_search_focused) {
-            if (c == '\b') {
-                if (g_search_box.len > 0) {
-                    g_search_box.text[--g_search_box.len] = '\0';
-                    wm_mark_all_dirty();
-                }
-                return;
-            } else if ((unsigned char)c >= 32 && g_search_box.len < 30) {
-                g_search_box.text[g_search_box.len++] = c;
-                g_search_box.text[g_search_box.len] = '\0';
-                wm_mark_all_dirty();
-                return;
-            }
-        }
-        if (c == KEY_UP || c == 'w' || c == 'W') {
+
+        // Navigation im gefilterten Startmenü
+        if (c == KEY_UP) {
             if (g_program_app_count > 0) {
                 start_menu_selected = (start_menu_selected - 1 + g_program_app_count) % g_program_app_count;
             }
-            wm_mark_all_dirty(); return;
+            wm_mark_all_dirty();
+            return;
         }
-        if (c == KEY_DOWN || c == 's' || c == 'S') {
+        if (c == KEY_DOWN) {
             if (g_program_app_count > 0) {
                 start_menu_selected = (start_menu_selected + 1) % g_program_app_count;
             }
-            wm_mark_all_dirty(); return;
+            wm_mark_all_dirty();
+            return;
         }
         if (c == '\n' || c == '\r') {
             int cur = 0;
             for (int i = 0; i < g_program_app_count; i++) {
                 if (str_contains_nocase(g_program_apps[i].name, g_search_box.text)) {
-                    if (cur == start_menu_selected) { execute_app_action(i); return; }
+                    if (cur == start_menu_selected) {
+                        execute_app_action(i);
+                        return;
+                    }
                     cur++;
                 }
             }
             return;
         }
+
+        // Text ins Spotlight-Suchfeld tippen
+        if (c == '\b') {
+            if (g_search_box.len > 0) {
+                g_search_box.text[--g_search_box.len] = '\0';
+                start_menu_selected = 0;
+                wm_mark_all_dirty();
+            }
+            return;
+        } else if ((unsigned char)c >= 32 && (unsigned char)c < 127 && g_search_box.len < 30) {
+            g_search_box.text[g_search_box.len++] = c;
+            g_search_box.text[g_search_box.len] = '\0';
+            start_menu_selected = 0;
+            wm_mark_all_dirty();
+            return;
+        }
     }
 
+    // ----------------------------------------------------
+    // AKTIVES FENSTER ODER DESKTOP-SHORTCUTS
+    // ----------------------------------------------------
     int active_id = wm_get_active_window_id();
     if (active_id >= 0) {
         Window *win = wm_get_window(active_id);
@@ -1589,17 +1539,18 @@ void desktop_handle_key(char c) {
                 wm_window_push_event(active_id, 2, 0, 0, c, 0, 0);
                 task_push_event(active_id, 2, 0, 0, c, 0, 0);
             }
+            return;
         }
-    } else {
-        if (c == KEY_DELETE || (unsigned char)c == 0x88 || (unsigned char)c == 0x7F) {
-            desktop_delete_selected();
-        } else if (c == '\n' || c == '\r') {
-            int total_icons = 1 + g_desktop_file_count;
-            for (int i = 0; i < total_icons; i++) {
-                if (g_selected_icons[i]) {
-                    open_desktop_item(i);
-                    break;
-                }
+    }
+
+    if (c == KEY_DELETE || (unsigned char)c == 0x88 || (unsigned char)c == 0x7F) {
+        desktop_delete_selected();
+    } else if (c == '\n' || c == '\r') {
+        int total_icons = 1 + g_desktop_file_count;
+        for (int i = 0; i < total_icons; i++) {
+            if (g_selected_icons[i]) {
+                open_desktop_item(i);
+                break;
             }
         }
     }

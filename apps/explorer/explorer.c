@@ -938,7 +938,7 @@ int main(int argc, char **argv) {
 
         // MAUSRAD SCROLLING
         if (st == 1 && ev.type == VELO_EV_SCROLL) {
-            int delta = ev.scroll_y ? ev.scroll_y : (ev.y > 0 ? 1 : -1);
+            int delta = ev.scroll_y;
             g_scroll_y -= delta * 36;
             if (g_scroll_y < 0) g_scroll_y = 0;
             if (g_scroll_y > g_max_scroll_y) g_scroll_y = g_max_scroll_y;

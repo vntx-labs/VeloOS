@@ -1,10 +1,15 @@
+#include <stddef.h>
+#include <stdint.h>
 #include "sched.h"
 #include "syscall.h"
 #include "pmm_vmm.h"
 #include "font.h"
 #include "wm.h"
 
-extern EFI_SYSTEM_TABLE* g_st;
+#ifndef NULL
+#define NULL ((void*)0)
+#endif
+
 void swap_buffers(void);
 
 #define LAPIC_ID            0x0020
@@ -18,12 +23,13 @@ void swap_buffers(void);
 static UINTN g_lapic_base = 0xFEE00000ULL;
 static int g_multitasking_active = 0;
 Task g_tasks[MAX_TASKS] __attribute__((aligned(64)));
+extern int g_app_win_ids[MAX_TASKS];
 static int g_current_task_idx = 0;
 static int g_total_tasks = 1;
 static UINT64 g_kernel_cr3 = 0;
 
 static UINT8 g_task_kernel_stacks[MAX_TASKS][TASK_STACK_SIZE] __attribute__((aligned(4096)));
-static UINT8 g_task_user_stacks[MAX_TASKS][TASK_STACK_SIZE]   __attribute__((aligned(4096)));
+UINT8 g_task_user_stacks[MAX_TASKS][TASK_STACK_SIZE]   __attribute__((aligned(4096)));
 static UINT8 g_exception_stack[65536]                         __attribute__((aligned(16)));
 
 typedef struct __attribute__((packed)) {
@@ -97,14 +103,14 @@ static inline void wrmsr(UINT32 msr, UINT64 val) {
 }
 
 static void disable_legacy_pic(void) {
-    outb(0x21, 0xFF); // Master PIC IRQs deaktivieren
-    outb(0xA1, 0xFF); // Slave PIC IRQs deaktivieren
+    outb(0x21, 0xFF);
+    outb(0xA1, 0xFF);
 }
 
 /* =========================================================================
  * PROZESS-SPEZIFISCHE ASYNCHRONE EVENT-QUEUE
  * ========================================================================= */
- void task_push_event(int task_id, int type, int x, int y, char key, int sx, int sy) {
+void task_push_event(int task_id, int type, int x, int y, char key, int sx, int sy) {
     if (task_id < 0 || task_id >= MAX_TASKS) return;
     Task *t = &g_tasks[task_id];
     if (t->state == TASK_UNUSED || t->state == TASK_DEAD) return;
@@ -157,7 +163,6 @@ __attribute__((naked, used)) static void common_exc_stub(void) {
         "pushq %rsi; pushq %rdi; pushq %rbp; pushq %r8\n\t"
         "pushq %r9;  pushq %r10; pushq %r11; pushq %r12\n\t"
         "pushq %r13; pushq %r14; pushq %r15\n\t"
-        "movw $0x10, %ax; movw %ax, %ds; movw %ax, %es\n\t"
         "movq %rsp, %rdi\n\t"
         "call kernel_exception_handler_c\n\t"
         "popq %r15; popq %r14; popq %r13; popq %r12\n\t"
@@ -182,7 +187,6 @@ __attribute__((naked)) static void syscall_int80_isr(void) {
         "pushq %rsi; pushq %rdi; pushq %rbp; pushq %r8\n\t"
         "pushq %r9;  pushq %r10; pushq %r11; pushq %r12\n\t"
         "pushq %r13; pushq %r14; pushq %r15\n\t"
-        "movw $0x10, %ax; movw %ax, %ds; movw %ax, %es\n\t"
         "call syscall_handler_c\n\t"
         "popq %r15; popq %r14; popq %r13; popq %r12\n\t"
         "popq %r11; popq %r10; popq %r9;  popq %r8\n\t"
@@ -229,7 +233,6 @@ UINT64 sched_schedule_c(UINT64 current_rsp) {
     g_tasks[g_current_task_idx].state = TASK_RUNNING;
     g_tss.rsp0 = (UINT64)(g_tasks[g_current_task_idx].stack_base + TASK_STACK_SIZE);
 
-    // ECHTE PML4-ISOLIERUNG: Hardware CR3 Umschaltung pro Prozess
     UINT64 target_cr3 = g_tasks[g_current_task_idx].cr3_pml4 ? 
                         (UINT64)(UINTN)g_tasks[g_current_task_idx].cr3_pml4 : g_kernel_cr3;
     __asm__ volatile("mov %0, %%cr3" : : "r"(target_cr3) : "memory");
@@ -247,7 +250,6 @@ __attribute__((naked)) void apic_timer_isr(void) {
         "pushq %rsi; pushq %rdi; pushq %rbp; pushq %r8\n\t"
         "pushq %r9;  pushq %r10; pushq %r11; pushq %r12\n\t"
         "pushq %r13; pushq %r14; pushq %r15\n\t"
-        "movw $0x10, %ax; movw %ax, %ds; movw %ax, %es\n\t"
         "movq %rsp, %rdi\n\t"
         "call sched_schedule_c\n\t"
         "movq %rax, %rsp\n\t"
@@ -408,8 +410,50 @@ int task_create_user(const char *name, UINT64 entry_point, UINT64 *cr3_pml4, UIN
     return slot;
 }
 
+static int app_basename_equal(const char *a, const char *b) {
+    if (!a || !b) return 0;
+
+    const char *aa = a;
+    const char *bb = b;
+    for (const char *p = a; *p; p++) {
+        if (*p == '/' || *p == '\\') aa = p + 1;
+    }
+    for (const char *p = b; *p; p++) {
+        if (*p == '/' || *p == '\\') bb = p + 1;
+    }
+
+    while (*aa || *bb) {
+        char ca = *aa, cb = *bb;
+        if (ca >= 'a' && ca <= 'z') ca -= 32;
+        if (cb >= 'a' && cb <= 'z') cb -= 32;
+        if (ca != cb) return 0;
+        if (*aa) aa++;
+        if (*bb) bb++;
+    }
+    return 1;
+}
+
 int task_spawn_app(const char *filename) {
-    if (!filename) return -1;
+    if (!filename || !filename[0]) return -1;
+
+    for (int i = 1; i < MAX_TASKS; i++) {
+        if (g_tasks[i].state == TASK_UNUSED || g_tasks[i].state == TASK_DEAD) continue;
+        if (!g_tasks[i].is_user) continue;
+        if (!app_basename_equal(g_tasks[i].name, filename)) continue;
+
+        if (g_app_win_ids[i] >= 0) {
+            Window *win = wm_get_window(g_app_win_ids[i]);
+            if (win && !win->is_closed) {
+                wm_focus_window(g_app_win_ids[i]);
+                wm_mark_all_dirty();
+                return i;
+            } else {
+                g_app_win_ids[i] = -1;
+            }
+        }
+        return i;
+    }
+
     return load_and_run_app(filename);
 }
 
@@ -429,8 +473,14 @@ void task_sleep(UINT32 ticks) {
 void task_exit(void) {
     Task *cur = &g_tasks[g_current_task_idx];
     cur->state = TASK_DEAD;
+
+    if (g_current_task_idx >= 0 && g_current_task_idx < MAX_TASKS && g_app_win_ids[g_current_task_idx] >= 0) {
+        wm_close_window(g_app_win_ids[g_current_task_idx]);
+        g_app_win_ids[g_current_task_idx] = -1;
+    }
     
     if (cur->cr3_pml4) {
+        __asm__ volatile("mov %0, %%cr3" : : "r"(g_kernel_cr3) : "memory");
         vmm_destroy_address_space(cur->cr3_pml4);
         cur->cr3_pml4 = NULL;
     }
@@ -509,7 +559,7 @@ void sched_start(void) {
     g_multitasking_active = 1;
     
     lapic_write(LAPIC_LVT_TIMER, (1U << 17) | APIC_TIMER_VECTOR);
-    lapic_write(LAPIC_TIMER_INITCNT, 0x100000); // 100 Hz Timer Ticks
+    lapic_write(LAPIC_TIMER_INITCNT, 0x100000);
     
     __asm__ volatile("sti");
 }

@@ -1,5 +1,11 @@
+#include <stddef.h>
+#include <stdint.h>
 #include "net.h"
 #include "sched.h"
+
+#ifndef NULL
+#define NULL ((void*)0)
+#endif
 
 void klog(const char *s);
 void *memmove(void *dest, const void *src, UINTN n);

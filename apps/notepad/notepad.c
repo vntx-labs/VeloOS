@@ -365,19 +365,18 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        // ==========================================================
-        // KLASSISCHE MAUSRAD-SCROLLRICHTUNG (WIE IN WINDOWS)
-        // ==========================================================
+        // Präzise, Windows-konforme Scroll-Verarbeitung:
         if (st == 1 && ev.type == VELO_EV_SCROLL) {
-            // Nach unten drehen (ev.scroll_y < 0) -> Text wandert nach oben (g_scroll_line nimmt zu)
-            // Nach oben drehen (ev.scroll_y > 0) -> Text wandert nach unten (g_scroll_line nimmt ab)
-            if (ev.scroll_y != 0) {
-                g_scroll_line += ev.scroll_y * 3;
+            int delta = ev.scroll_y;
+            if (delta != 0) {
+                // Positives Delta = Nach oben scrollen (- Zeilen)
+                // Negatives Delta = Nach unten scrollen (+ Zeilen)
+                g_scroll_line -= delta * 3;
                 if (g_scroll_line < 0) g_scroll_line = 0;
                 if (g_scroll_line >= g_total_lines) g_scroll_line = g_total_lines - 1;
             }
             if (ev.scroll_x != 0 && !g_word_wrap) {
-                g_scroll_col += ev.scroll_x * 4;
+                g_scroll_col -= ev.scroll_x * 4;
                 if (g_scroll_col < 0) g_scroll_col = 0;
             }
             render_notepad(win, g_win_w, g_win_h);

@@ -1,8 +1,17 @@
 #ifndef SETUP_H
 #define SETUP_H
 
-#include <efi.h>
-#include <efilib.h>
+#include <stdint.h>
+
+#ifndef UINT32
+typedef uint8_t   UINT8;
+typedef uint16_t  UINT16;
+typedef uint32_t  UINT32;
+typedef uint64_t  UINT64;
+typedef int64_t   INT64;
+typedef uint64_t  UINTN;
+typedef void      VOID;
+#endif
 
 typedef struct __attribute__((packed)) {
     char magic[8]; // "VELO_CFG"

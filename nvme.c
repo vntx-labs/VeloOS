@@ -1,4 +1,10 @@
+#include <stddef.h>
+#include <stdint.h>
 #include "nvme.h"
+
+#ifndef NULL
+#define NULL ((void*)0)
+#endif
 
 void klog(const char *s);
 
@@ -178,9 +184,9 @@ static int nvme_submit_io_cmd(NVME_CONTROLLER *ctrl, NVME_COMMAND *cmd, NVME_COM
 }
 
 static int init_controller(NVME_CONTROLLER *ctrl, int slot_idx) {
-    UINT32 cap_high = nvme_read32(ctrl, NVME_REG_CAP + 4);
-    ctrl->dstrd = (cap_high >> 0) & 0xF;
+    if (!ctrl || ctrl->bar0 == 0) return 0;
 
+    // 1. ZUERST Controller sauber deaktivieren, bevor IRGENDETWAS geschrieben wird
     UINT32 cc = nvme_read32(ctrl, NVME_REG_CC);
     if (cc & 1) {
         nvme_write32(ctrl, NVME_REG_CC, cc & ~1);
@@ -190,6 +196,11 @@ static int init_controller(NVME_CONTROLLER *ctrl, int slot_idx) {
         }
     }
 
+    // 2. Doorbell Stride aus CAP lesen
+    UINT32 cap_high = nvme_read32(ctrl, NVME_REG_CAP + 4);
+    ctrl->dstrd = (cap_high >> 0) & 0xF;
+
+    // 3. ALLE Pointer und Puffer im RAM VOLLSTAENDIG initialisieren und nullen
     ctrl->asq = g_asq_buf[slot_idx];
     ctrl->acq = g_acq_buf[slot_idx];
     ctrl->asq_tail = 0;
@@ -199,11 +210,26 @@ static int init_controller(NVME_CONTROLLER *ctrl, int slot_idx) {
     __builtin_memset(ctrl->asq, 0, sizeof(g_asq_buf[slot_idx]));
     __builtin_memset(ctrl->acq, 0, sizeof(g_acq_buf[slot_idx]));
 
+    ctrl->iosq = g_iosq_buf[slot_idx];
+    ctrl->iocq = g_iocq_buf[slot_idx];
+    ctrl->iosq_tail = 0;
+    ctrl->iocq_head = 0;
+    ctrl->iocq_phase = 1;
+    ctrl->io_cmd_id = 0;
+    __builtin_memset(ctrl->iosq, 0, sizeof(g_iosq_buf[slot_idx]));
+    __builtin_memset(ctrl->iocq, 0, sizeof(g_iocq_buf[slot_idx]));
+
+    // 4. Admin Queue Konfiguration in Hardware schreiben, WAEHREND der Controller noch disabled ist
     UINT32 aqa = ((NVME_ADMIN_COMPLETION_QUEUE_SIZE - 1) << 16) | (NVME_ADMIN_SUBMISSION_QUEUE_SIZE - 1);
     nvme_write32(ctrl, NVME_REG_AQA, aqa);
     nvme_write64(ctrl, NVME_REG_ASQ, (UINT64)(UINTN)ctrl->asq);
     nvme_write64(ctrl, NVME_REG_ACQ, (UINT64)(UINTN)ctrl->acq);
 
+    // 5. Doorbells zuruecksetzen
+    nvme_ring_doorbell(ctrl, 0, 0, 0);
+    nvme_ring_doorbell(ctrl, 0, 1, 0);
+
+    // 6. Jetzt Controller mit den vorbereiteten Zeigern einschalten
     cc = (6 << 16) | (4 << 20) | (0 << 7) | (0 << 4) | 1;
     nvme_write32(ctrl, NVME_REG_CC, cc);
 
@@ -213,13 +239,7 @@ static int init_controller(NVME_CONTROLLER *ctrl, int slot_idx) {
     }
     if (!t) return 0;
 
-    // FEHLER BEHOBEN: Puffer VOR dem Absenden des Admin-Befehls zuweisen!
-    ctrl->iocq = g_iocq_buf[slot_idx];
-    ctrl->iocq_head = 0;
-    ctrl->iocq_phase = 1;
-    ctrl->io_cmd_id = 0;
-    __builtin_memset(ctrl->iocq, 0, sizeof(g_iocq_buf[slot_idx]));
-
+    // 7. IO Completion Queue erstellen (Pointer ctrl->iocq ist laengst ready)
     NVME_COMMAND cmd;
     __builtin_memset(&cmd, 0, sizeof(NVME_COMMAND));
     cmd.opcode = NVME_ADMIN_CMD_CREATE_IO_CQ;
@@ -228,10 +248,7 @@ static int init_controller(NVME_CONTROLLER *ctrl, int slot_idx) {
     cmd.cdw11 = 1;
     if (!nvme_submit_admin_cmd(ctrl, &cmd, NULL)) return 0;
 
-    ctrl->iosq = g_iosq_buf[slot_idx];
-    ctrl->iosq_tail = 0;
-    __builtin_memset(ctrl->iosq, 0, sizeof(g_iosq_buf[slot_idx]));
-
+    // 8. IO Submission Queue erstellen (Pointer ctrl->iosq ist laengst ready)
     __builtin_memset(&cmd, 0, sizeof(NVME_COMMAND));
     cmd.opcode = NVME_ADMIN_CMD_CREATE_IO_SQ;
     cmd.prp1 = (UINT64)(UINTN)ctrl->iosq;
@@ -239,6 +256,7 @@ static int init_controller(NVME_CONTROLLER *ctrl, int slot_idx) {
     cmd.cdw11 = (1 << 16) | 1;
     if (!nvme_submit_admin_cmd(ctrl, &cmd, NULL)) return 0;
 
+    // 9. Identify Controller
     __builtin_memset(g_identify_buf, 0, 4096);
     __builtin_memset(&cmd, 0, sizeof(NVME_COMMAND));
     cmd.opcode = NVME_ADMIN_CMD_IDENTIFY;
@@ -253,6 +271,7 @@ static int init_controller(NVME_CONTROLLER *ctrl, int slot_idx) {
         __builtin_memcpy(ctrl->model, "NVMe PCIe SSD", 14);
     }
 
+    // 10. Identify Namespace
     __builtin_memset(g_identify_buf, 0, 4096);
     __builtin_memset(&cmd, 0, sizeof(NVME_COMMAND));
     cmd.opcode = NVME_ADMIN_CMD_IDENTIFY;
@@ -296,8 +315,6 @@ int init_nvme(void) {
                 UINT8 sub_class  = (UINT8)(class_rev >> 16);
 
                 if (base_class == 0x01 && sub_class == 0x08) {
-                    pci_cfg_write32((UINT8)bus, slot, func, 0x04, 0x0007);
-
                     UINT32 bar0_low = pci_cfg_read32((UINT8)bus, slot, func, 0x10);
                     UINT64 bar0 = (UINT64)(bar0_low & 0xFFFFFFF0U);
                     if ((bar0_low & 0x6U) == 0x4U) {
@@ -306,6 +323,9 @@ int init_nvme(void) {
                     }
 
                     if (bar0 == 0) continue;
+
+                    // PCI Bus Master & Memory Space aktivieren
+                    pci_cfg_write32((UINT8)bus, slot, func, 0x04, 0x0007);
 
                     int idx = g_nvme_count;
                     g_nvme_ctrls[idx].bar0 = (UINTN)bar0;

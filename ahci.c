@@ -1,5 +1,11 @@
+#include <stddef.h>
+#include <stdint.h>
 #include "ahci.h"
 #include "nvme.h"
+
+#ifndef NULL
+#define NULL ((void*)0)
+#endif
 
 typedef volatile struct __attribute__((packed)) tagHBA_PORT {
     UINT32 clb;

@@ -11,37 +11,45 @@ ARCH    = x86_64
 EFI_INCLUDE  = /usr/include/efi
 EFI_INC_ARCH = /usr/include/efi/$(ARCH)
 
-# Header fuer Ring-3 Velo-Apps (nutzen deine VeloLIBC)
 USER_INCLUDE = -I./include -I./include/libc -I./include/velo
 
 # ==========================================
-# KERNEL COMPILER-FLAGS (FREESTANDING / EFI)
+# BOOTLOADER COMPILER-FLAGS (UEFI APPLICATION)
 # ==========================================
-CFLAGS = -I$(EFI_INCLUDE) \
-         -I$(EFI_INC_ARCH) \
-         -I./include \
-         -fno-stack-protector \
-         -fpic \
-         -fshort-wchar \
-         -mno-red-zone \
-         -march=x86-64 \
-         -mno-sse \
-         -mno-sse2 \
-         -mno-mmx \
-         -mno-avx \
-         -mno-avx2 \
-         -mno-sse3 \
-         -mno-ssse3 \
-         -mno-sse4.1 \
-         -mno-sse4.2 \
-         -fno-builtin \
-         -fno-tree-loop-distribute-patterns \
-         -Wall \
-         -Wextra \
-         -O2
+BOOT_CFLAGS = -I$(EFI_INCLUDE) \
+              -I$(EFI_INC_ARCH) \
+              -I./include \
+              -fno-stack-protector \
+              -fpic \
+              -fshort-wchar \
+              -mno-red-zone \
+              -march=x86-64 \
+              -fno-builtin \
+              -Wall \
+              -Wextra \
+              -O2
 
 # ==========================================
-# USERLAND APP COMPILER-FLAGS (REINES C)
+# FREESTANDING KERNEL COMPILER-FLAGS (KEIN EFI!)
+# ==========================================
+KERN_CFLAGS = -I./include \
+              -fno-stack-protector \
+              -fno-builtin \
+              -fno-asynchronous-unwind-tables \
+              -fno-unwind-tables \
+              -mno-red-zone \
+              -march=x86-64 \
+              -mno-sse3 \
+              -mno-ssse3 \
+              -mno-sse4.1 \
+              -mno-sse4.2 \
+              -fno-tree-loop-distribute-patterns \
+              -Wall \
+              -Wextra \
+              -O2
+
+# ==========================================
+# USERLAND APP COMPILER-FLAGS (RING 3 APPS)
 # ==========================================
 USER_CFLAGS = $(USER_INCLUDE) \
               -fno-stack-protector \
@@ -74,25 +82,15 @@ KERNEL_OBJS = kernel.o \
               sched.o \
               pmm_vmm.o \
               kshell.o \
+              intro.o \
               wallpaper.o
 
-LDFLAGS = -nostdlib \
-          -znocombreloc \
-          -shared \
-          -Bsymbolic \
-          -T /usr/lib/elf_x86_64_efi.lds \
-          /usr/lib/crt0-efi-$(ARCH).o \
-          $(KERNEL_OBJS) \
-          -L/usr/lib \
-          -lefi \
-          -lgnuefi
+.PHONY: all clean run reset-disk disk-reset apps bin_tools libc sync-disk update-disk
 
-.PHONY: all clean run reset-disk disk-reset apps bin_tools libc iso
-
-all: os.img
+all: os.img sync-disk
 
 # ==========================================
-# WALLPAPER CONVERSION & LINKING
+# 1. WALLPAPER CONVERSION & LINKING
 # ==========================================
 wallpaper.bin:
 	@if [ -f wallpaper.png ]; then \
@@ -113,13 +111,18 @@ wallpaper.o: wallpaper.bin
 	  wallpaper.bin wallpaper.o
 
 # ==========================================
-# KERNEL KOMPILIERUNG
+# 2. CUSTOM UEFI BOOTLOADER (BOOTX64.EFI)
 # ==========================================
-%.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+bootloader.o: bootloader.c
+	$(CC) $(BOOT_CFLAGS) -c bootloader.c -o bootloader.o
 
-kernel.efi: $(KERNEL_OBJS)
-	$(LD) $(LDFLAGS) -o kernel.so
+bootloader.efi: bootloader.o
+	$(LD) -nostdlib -znocombreloc -shared -Bsymbolic \
+	  -T /usr/lib/elf_x86_64_efi.lds \
+	  /usr/lib/crt0-efi-$(ARCH).o \
+	  bootloader.o \
+	  -L/usr/lib -lefi -lgnuefi \
+	  -o bootloader.so
 	$(OBJCOPY) \
 	  -j .text \
 	  -j .sdata \
@@ -131,11 +134,20 @@ kernel.efi: $(KERNEL_OBJS)
 	  -j .rela \
 	  -j .reloc \
 	  --target=efi-app-$(ARCH) \
-	  kernel.so \
-	  kernel.efi
+	  bootloader.so \
+	  bootloader.efi
 
 # ==========================================
-# VELOLIBC BAUEN
+# 3. FREESTANDING BARE-METAL KERNEL (KERNEL.ELF)
+# ==========================================
+%.o: %.c
+	$(CC) $(KERN_CFLAGS) -c $< -o $@
+
+KERNEL.ELF: $(KERNEL_OBJS)
+	$(LD) -nostdlib -T kernel.lds $(KERNEL_OBJS) -o KERNEL.ELF
+
+# ==========================================
+# 4. VELOLIBC BAUEN
 # ==========================================
 libc: libc/velolibc.o
 	@mkdir -p lib
@@ -146,7 +158,7 @@ libc/velolibc.o: libc/velolibc.c
 	$(CC) $(USER_CFLAGS) -c libc/velolibc.c -o libc/velolibc.o
 
 # ==========================================
-# USERLAND APPS (apps/*) BAUEN
+# 5. USERLAND APPS (apps/*) BAUEN
 # ==========================================
 apps: libc
 	@set -e; \
@@ -172,7 +184,7 @@ apps: libc
 	fi
 
 # ==========================================
-# UNIX COREUTILS (bin/*.c) BAUEN
+# 6. UNIX COREUTILS (bin/*.c) BAUEN
 # ==========================================
 bin_tools: libc
 	@set -e; \
@@ -189,9 +201,9 @@ bin_tools: libc
 	fi
 
 # ==========================================
-# DISK-IMAGE: BARE-METAL & UEFI KOMPATIBEL
+# 7. DISK-IMAGE INITIALISIERUNG
 # ==========================================
-os.img: kernel.efi apps bin_tools
+os.img: bootloader.efi KERNEL.ELF apps bin_tools
 	@if [ ! -f os.img ]; then \
 		echo "[+] Initialisiere 514 MB Festplatten-Image (os.img) mit MBR-ESP..."; \
 		rm -f esp.img; \
@@ -202,7 +214,14 @@ os.img: kernel.efi apps bin_tools
 		dd if=esp.img of=os.img bs=512 seek=2048 conv=notrunc status=none; \
 		rm -f esp.img; \
 	fi
-	@echo "[+] Erstelle Verzeichnis-Hierarchie auf os.img..."
+	@$(MAKE) sync-disk
+
+# ==========================================
+# 8. LIVE-SYNCHRONISATION (OHNE DISK-RESET)
+# ==========================================
+update-disk: sync-disk
+sync-disk: bootloader.efi KERNEL.ELF apps bin_tools
+	@echo "[+] Aktualisiere Systemdateien und Apps auf os.img..."
 	@mmd -D s -i os.img@@1M ::/EFI 2>/dev/null || true
 	@mmd -D s -i os.img@@1M ::/EFI/BOOT 2>/dev/null || true
 	@mmd -D s -i os.img@@1M ::/bin 2>/dev/null || true
@@ -216,9 +235,9 @@ os.img: kernel.efi apps bin_tools
 	@mmd -D s -i os.img@@1M ::/Users/Documents 2>/dev/null || true
 	@mmd -D s -i os.img@@1M ::/Users/Downloads 2>/dev/null || true
 	@mmd -D s -i os.img@@1M ::/Users/Pictures 2>/dev/null || true
-	@echo "[+] Kopiere System-Dateien & Boot-Loader..."
-	@mdel -i os.img@@1M ::/EFI/BOOT/BOOTX64.EFI 2>/dev/null || true
-	@mcopy -i os.img@@1M kernel.efi ::/EFI/BOOT/BOOTX64.EFI
+	@mcopy -o -i os.img@@1M bootloader.efi ::/EFI/BOOT/BOOTX64.EFI
+	@mcopy -o -i os.img@@1M KERNEL.ELF ::/KERNEL.ELF
+	@mcopy -o -i os.img@@1M KERNEL.ELF ::/EFI/BOOT/KERNEL.ELF
 	@if [ -f WALL.BIN ]; then mcopy -o -i os.img@@1M WALL.BIN ::/VeloOS/WALL.BIN; fi
 	@if [ -d bin_out ]; then \
 		for b in bin_out/*.BIN; do \
@@ -235,95 +254,31 @@ os.img: kernel.efi apps bin_tools
 			mcopy -o -i os.img@@1M "$$app" "::/Programs/$$app"; \
 		fi; \
 	done
-	@printf "Willkommen bei VeloOS!\n" > /tmp/velo_readme.txt
-	@mcopy -o -i os.img@@1M /tmp/velo_readme.txt "::/Users/Documents/README.TXT"
-	@printf "Willkommen auf dem VeloOS Desktop!\n" > /tmp/velo_welcome.txt
-	@mcopy -o -i os.img@@1M /tmp/velo_welcome.txt "::/Users/Desktop/Willkommen.txt"
-	@rm -f /tmp/velo_readme.txt /tmp/velo_welcome.txt
 	@if [ -f nvmedisk.img ]; then \
-		echo "[+] Synchronisiere Binaries mit nvmedisk.img..."; \
-		mdel -i nvmedisk.img@@1M ::/EFI/BOOT/BOOTX64.EFI 2>/dev/null || true; \
-		mcopy -o -i nvmedisk.img@@1M kernel.efi ::/EFI/BOOT/BOOTX64.EFI 2>/dev/null || true; \
-		for app in *.BIN; do \
-			if [ -f "$$app" ] && [ "$$app" != "WALL.BIN" ]; then \
-				mcopy -o -i nvmedisk.img@@1M "$$app" "::/$$app" 2>/dev/null || true; \
-				mcopy -o -i nvmedisk.img@@1M "$$app" "::/bin/$$app" 2>/dev/null || true; \
-				mcopy -o -i nvmedisk.img@@1M "$$app" "::/Programs/$$app" 2>/dev/null || true; \
+		if mdir -i nvmedisk.img@@1M ::/ 2>/dev/null >/dev/null; then \
+			echo "[+] Synchronisiere Updates auf installierte NVMe SSD (nvmedisk.img)..."; \
+			mcopy -o -i nvmedisk.img@@1M KERNEL.ELF ::/KERNEL.ELF 2>/dev/null || true; \
+			mcopy -o -i nvmedisk.img@@1M KERNEL.ELF ::/EFI/BOOT/KERNEL.ELF 2>/dev/null || true; \
+			mcopy -o -i nvmedisk.img@@1M bootloader.efi ::/EFI/BOOT/BOOTX64.EFI 2>/dev/null || true; \
+			if [ -d bin_out ]; then \
+				for b in bin_out/*.BIN; do \
+					if [ -f "$$b" ]; then \
+						fname=$$(basename "$$b"); \
+						mcopy -o -i nvmedisk.img@@1M "$$b" "::/bin/$$fname" 2>/dev/null || true; \
+					fi; \
+				done; \
 			fi; \
-		done; \
-		if [ -d bin_out ]; then \
-			for b in bin_out/*.BIN; do \
-				if [ -f "$$b" ]; then \
-					fname=$$(basename "$$b"); \
-					mcopy -o -i nvmedisk.img@@1M "$$b" "::/bin/$$fname" 2>/dev/null || true; \
+			for app in *.BIN; do \
+				if [ -f "$$app" ] && [ "$$app" != "WALL.BIN" ]; then \
+					mcopy -o -i nvmedisk.img@@1M "$$app" "::/$$app" 2>/dev/null || true; \
+					mcopy -o -i nvmedisk.img@@1M "$$app" "::/bin/$$app" 2>/dev/null || true; \
+					mcopy -o -i nvmedisk.img@@1M "$$app" "::/Programs/$$app" 2>/dev/null || true; \
 				fi; \
 			done; \
 		fi; \
 	fi
 
-# ==========================================
-# ISO-BUILD TARGET (UEFI FAT32 ESP + VENTOY)
-# ==========================================
-iso: kernel.efi apps bin_tools
-	@rm -rf iso_root efiboot.img velo.iso
-	@mkdir -p iso_root/EFI/BOOT
-	@echo "[+] Erstelle 96 MB FAT32 EFI-System-Partition..."
-	@dd if=/dev/zero of=efiboot.img bs=1M count=96 status=none
-	@mkfs.vfat -F 32 -n "VELO_BOOT" efiboot.img > /dev/null
-	@mmd -i efiboot.img ::/EFI 2>/dev/null || true
-	@mmd -i efiboot.img ::/EFI/BOOT 2>/dev/null || true
-	@mmd -i efiboot.img ::/bin 2>/dev/null || true
-	@mmd -i efiboot.img ::/apps 2>/dev/null || true
-	@mmd -i efiboot.img ::/Programs 2>/dev/null || true
-	@mmd -i efiboot.img ::/VeloOS 2>/dev/null || true
-	@mmd -i efiboot.img ::/VeloOS/System32 2>/dev/null || true
-	@mmd -i efiboot.img ::/Users 2>/dev/null || true
-	@mmd -i efiboot.img ::/Users/Desktop 2>/dev/null || true
-	@mmd -i efiboot.img ::/Users/Documents 2>/dev/null || true
-	@mcopy -i efiboot.img kernel.efi ::/EFI/BOOT/BOOTX64.EFI
-	@if [ -f WALL.BIN ]; then mcopy -o -i efiboot.img WALL.BIN ::/VeloOS/WALL.BIN; fi
-	@if [ -d bin_out ]; then \
-		for b in bin_out/*.BIN; do \
-			if [ -f "$$b" ]; then \
-				fname=$$(basename "$$b"); \
-				mcopy -o -i efiboot.img "$$b" "::/bin/$$fname"; \
-			fi; \
-		done; \
-	fi
-	@for app in *.BIN; do \
-		if [ -f "$$app" ] && [ "$$app" != "WALL.BIN" ]; then \
-			mcopy -o -i efiboot.img "$$app" "::/$$app"; \
-			mcopy -o -i efiboot.img "$$app" "::/bin/$$app"; \
-			mcopy -o -i efiboot.img "$$app" "::/Programs/$$app"; \
-		fi; \
-	done
-	@printf "VeloOS Live USB\n" > /tmp/live.txt
-	@mcopy -o -i efiboot.img /tmp/live.txt "::/Users/Desktop/Willkommen.txt"
-	@rm -f /tmp/live.txt
-	@cp efiboot.img iso_root/EFI/BOOT/efiboot.img
-	@cp kernel.efi iso_root/EFI/BOOT/BOOTX64.EFI
-	@echo "[+] Generiere hybrid-bootfaehiges ISO mit El-Torito UEFI (0xEF) & GPT-Partition..."
-	@xorriso -as mkisofs \
-		-iso-level 3 \
-		-full-iso9660-filenames \
-		-R -r -J -joliet-long \
-		-V "VELO_BOOT" \
-		-eltorito-alt-boot \
-		-e EFI/BOOT/efiboot.img \
-		-no-emul-boot \
-		-isohybrid-gpt-basdat \
-		-o velo.iso iso_root
-	@rm -rf iso_root efiboot.img
-	@echo ""
-	@echo "========================================================="
-	@echo "[ERFOLG] velo.iso wurde erfolgreich gebaut!"
-	@echo "Kompatibel mit: Ventoy, Rufus (DD-Modus) & direktem USB-Boot"
-	@echo "========================================================="
-
-# ==========================================
-# EMULATION (QEMU MIT ECHTEM USB 3.0 xHCI + TABLET + TASTATUR)
-# ==========================================
-run: os.img
+run: os.img sync-disk
 	@if [ ! -f nvmedisk.img ]; then \
 		echo "[+] Erstelle 2 GB PCIe NVMe SSD (nvmedisk.img)..."; \
 		dd if=/dev/zero of=nvmedisk.img bs=1M count=2048 status=none; \
@@ -333,8 +288,6 @@ run: os.img
 	  -m 4096M \
 	  -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
 	  -machine q35 \
-	  -device qemu-xhci,id=xhci \
-	  -device usb-tablet,bus=xhci.0 \
 	  -drive file=os.img,format=raw,if=none,id=bootdisk \
 	  -device ide-hd,drive=bootdisk,bus=ide.0 \
 	  -drive file=nvmedisk.img,format=raw,if=none,id=nvme0 \
@@ -350,6 +303,6 @@ reset-disk:
 	@echo "[+] Alle Festplattenabbilder wurden vollstaendig zurueckgesetzt."
 
 clean:
-	rm -f *.o *.so *.efi *.BIN libc/*.o lib/*.a esp.img efiboot.img velo.iso wallpaper.bin wallpaper.o
+	rm -f *.o *.so *.efi *.BIN *.bin KERNEL.ELF bootloader.efi bootloader.so libc/*.o lib/*.a esp.img efiboot.img velo.iso wallpaper.bin wallpaper.o
 	rm -rf dist iso_root bin_out /tmp/litehtml_build
 	@echo "[+] Build-Dateien aufgeraeumt."

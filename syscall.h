@@ -1,9 +1,18 @@
 #ifndef SYSCALL_H
 #define SYSCALL_H
 
-#include <efi.h>
-#include <efilib.h>
+#include <stdint.h>
 #include <velo/syscall.h>
+
+#ifndef UINT32
+typedef uint8_t   UINT8;
+typedef uint16_t  UINT16;
+typedef uint32_t  UINT32;
+typedef uint64_t  UINT64;
+typedef int64_t   INT64;
+typedef uint64_t  UINTN;
+typedef void      VOID;
+#endif
 
 void enable_user_paging(void);
 void init_ring3_and_syscalls(void);

@@ -1,12 +1,21 @@
 #ifndef WM_H
 #define WM_H
 
-#include <efi.h>
-#include <efilib.h>
+#include <stdint.h>
 
-#define MAX_WINDOWS 64
+#ifndef UINT32
+typedef uint8_t   UINT8;
+typedef uint16_t  UINT16;
+typedef uint32_t  UINT32;
+typedef uint64_t  UINT64;
+typedef int64_t   INT64;
+typedef uint64_t  UINTN;
+typedef void      VOID;
+#endif
+
+#define MAX_WINDOWS 8
 #define SURFACE_STRIDE 1024
-#define SURFACE_HEIGHT 3072
+#define SURFACE_HEIGHT 768
 #define WIN_EVENT_QUEUE_SIZE 32
 
 #define ANIM_NONE     0
@@ -43,9 +52,8 @@ typedef struct {
     UINT32 bg_color;
     UINT32 *surface;
 
-    /* macOS Animations-Status */
     int anim_state;
-    int anim_progress; // 0 bis 100
+    int anim_progress;
     int target_dock_x;
     int target_dock_y;
 
@@ -73,6 +81,9 @@ void wm_clear_dirty(void);
 void wm_init(void);
 int  wm_create_window(int x, int y, int w, int h, const char *title, void (*on_paint)(int, int, int, int, int));
 int  wm_create_window_auto(const char *title, int content_w, int content_h, void (*on_paint)(int, int, int, int, int));
+
+int wm_handle_mouse(int mouse_x, int mouse_y, int left_click, int right_click, int scroll_x, int scroll_y);
+void draw_velo_startorb(int cx, int cy, int r);
 
 void wm_close_window(int id);
 void wm_close_active(void);
@@ -102,7 +113,6 @@ void wm_update_drag(int mouse_x, int mouse_y);
 void wm_stop_drag(void);
 int  wm_is_dragging(void);
 
-/* Surface-Zeichnen */
 void wm_surface_clear(int win_id, UINT32 color);
 void wm_surface_draw_rect(int win_id, int x, int y, int w, int h, UINT32 color);
 void wm_surface_draw_gradient(int win_id, int x, int y, int w, int h, UINT32 top_col, UINT32 bot_col);
@@ -117,7 +127,6 @@ void wm_surface_draw_searchbox(int win_id, int x, int y, int w, const char *quer
 void wm_surface_draw_command_bar(int win_id, int y, int w);
 void wm_surface_draw_modal_dialog(int win_id, int x, int y, int w, int h, const char *title);
 
-/* Kontrast- & Textfunktionen */
 UINT32 wm_get_contrast_color(UINT32 bg_color);
 void wm_draw_text(const char *str, int x, int y, UINT32 fg_color, UINT32 bg_color);
 void wm_draw_text_auto(const char *str, int x, int y, UINT32 bg_color);
@@ -125,7 +134,6 @@ void wm_draw_text_scaled(const char *str, int x, int y, int scale, UINT32 fg_col
 void wm_draw_text_shadow(const char *str, int x, int y, int scale, UINT32 fg_color, UINT32 shadow_color);
 void wm_draw_text_wrapped(const char *str, int x, int y, int max_w, int max_h, UINT32 fg_color, UINT32 bg_color);
 
-/* Glättungs- und Alpha-Grafikprimitive */
 UINT32 alpha_blend(UINT32 fg, UINT32 bg, UINT32 alpha);
 void draw_circle_aa(int cx, int cy, int r, UINT32 color);
 void draw_circle_button_aa(int cx, int cy, int r, UINT32 fill_color, UINT32 border_color);

@@ -1,19 +1,6 @@
 #include "keyboard.h"
-#include <efi.h>
-#include <efilib.h>
-
-#ifndef EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL_GUID
-static EFI_GUID g_text_input_ex_guid = {
-    0xdd9e3968, 0x4469, 0x4250,
-    {0xa0, 0x46, 0x4a, 0x22, 0xcb, 0x76, 0xca, 0x76}
-};
-#else
-static EFI_GUID g_text_input_ex_guid = EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL_GUID;
-#endif
-
-#define MAX_KEYBOARD_HANDLES 8
-static EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *g_keyboards[MAX_KEYBOARD_HANDLES];
-static UINTN g_keyboard_count = 0;
+#include <stddef.h>
+#include <stdint.h>
 
 static int g_current_layout = LAYOUT_QWERTZ;
 static int shift_active = 0;
@@ -77,7 +64,7 @@ static const char keymap_qwertz[128] = {
     [0x34] = '.', 
     [0x35] = '-',
     [0x39] = ' ', 
-    [0x56] = '<'         /* Die Taste zwischen Shift-Links und Y */
+    [0x56] = '<'         /* Taste zwischen Shift-Links und Y */
 };
 
 /* 2. QWERTZ Shift */
@@ -152,83 +139,6 @@ static const char keymap_qwerty_shift[128] = {
     [0x39] = ' ', [0x56] = '>'
 };
 
-/* =========================================================================
- * UEFI UNICODE KONVERTIERUNG (FALLBACK)
- * ========================================================================= */
-static char convert_uefi_unicode_to_qwertz(CHAR16 u, int is_shift, int is_altgr) {
-    if (is_altgr || (ctrl_active && alt_active)) {
-        if (u == L'q' || u == L'Q' || u == L'@') return '@';
-        if (u == L'7' || u == L'&' || u == L'/') return '{';
-        if (u == L'8' || u == L'*' || u == L'(') return '[';
-        if (u == L'9' || u == L'(' || u == L')') return ']';
-        if (u == L'0' || u == L')' || u == L'=') return '}';
-        if (u == L'e' || u == L'E') return 'E';
-        if (u == L'-' || u == L'_' || (unsigned char)u == 0xDF) return '\\';
-        if (u == L'+' || u == L'*' || u == L']' || u == L'}') return '~';
-        if (u == L'<' || u == L'>' || u == L'|') return '|';
-    }
-
-    if (u == L'y') return 'z';
-    if (u == L'z') return 'y';
-    if (u == L'Y') return 'Z';
-    if (u == L'Z') return 'Y';
-
-    /* Shift + Komma = ; | Shift + Punkt = : */
-    if (u == L'<') return is_shift ? ';' : '<';
-    if (u == L'>') return is_shift ? ':' : '>';
-    if (u == L',' && is_shift) return ';';
-    if (u == L'.' && is_shift) return ':';
-    if (u == L',' && !is_shift) return ',';
-    if (u == L'.' && !is_shift) return '.';
-
-    /* Shift + Zahlen */
-    if (u == L'!') return '!';
-    if (u == L'@') return '"';            /* Shift + 2 = " */
-    if (u == L'#') return is_shift ? (char)0xA7 : '#';
-    if (u == L'$') return '$';            /* Shift + 4 = $ */
-    if (u == L'%') return '%';            /* Shift + 5 = % */
-    if (u == L'^') return '&';            /* Shift + 6 = & */
-    if (u == L'&') return '/';            /* Shift + 7 = / */
-    if (u == L'*') return '(';            /* Shift + 8 = ( */
-    if (u == L'(') return ')';            /* Shift + 9 = ) */
-    if (u == L')') return '=';            /* Shift + 0 = = */
-
-    if (is_shift) {
-        if (u == L'1') return '!';
-        if (u == L'2') return '"';
-        if (u == L'3') return (char)0xA7; /* § */
-        if (u == L'4') return '$';
-        if (u == L'5') return '%';
-        if (u == L'6') return '&';
-        if (u == L'7') return '/';
-        if (u == L'8') return '(';
-        if (u == L'9') return ')';
-        if (u == L'0') return '=';
-    }
-
-    /* Umlaute und Sonderzeichen */
-    if (u == L'[') return (char)0xFC;     /* ü */
-    if (u == L'{') return (char)0xDC;     /* Ü */
-    if (u == L';') return (char)0xF6;     /* ö */
-    if (u == L':') return (char)0xD6;     /* Ö */
-    if (u == L'\'') return (char)0xE4;    /* ä */
-    if (u == L'"') return (char)0xC4;     /* Ä */
-    if (u == L'-') return (char)0xDF;     /* ß */
-    if (u == L'_') return '?';            /* Shift + ß = ? */
-    if (u == L'=') return '`';
-    if (u == L'+') return '*';
-    if (u == L']') return '+';
-    if (u == L'}') return '*';
-    if (u == L'\\') return is_shift ? '\'' : '#';
-    if (u == L'|') return is_shift ? '\'' : '#';
-    if (u == L'/') return '-';
-    if (u == L'?') return '_';
-    if (u == L'`') return '^';
-    if (u == L'~') return (char)0xB0;     /* Shift + ^ = ° */
-
-    return (char)(u & 0xFF);
-}
-
 void init_keyboard(void) {
     shift_active = 0;
     ctrl_active = 0;
@@ -236,45 +146,12 @@ void init_keyboard(void) {
     altgr_active = 0;
     delete_active = 0;
     e0_prefix = 0;
-    g_keyboard_count = 0;
 
-    outb_kbc_key(0x64, 0xAE);
-
-    if (ST && ST->ConIn) {
-        uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
-    }
-
-    if (!BS) return;
-
-    UINTN handle_count = 0;
-    EFI_HANDLE *handles = NULL;
-    EFI_STATUS status = uefi_call_wrapper(BS->LocateHandleBuffer, 5,
-                                          ByProtocol, &g_text_input_ex_guid,
-                                          NULL, &handle_count, &handles);
-
-    if (!EFI_ERROR(status) && handles) {
-        for (UINTN i = 0; i < handle_count && g_keyboard_count < MAX_KEYBOARD_HANDLES; i++) {
-            EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *kbd = NULL;
-            status = uefi_call_wrapper(BS->HandleProtocol, 3, handles[i], &g_text_input_ex_guid, (void**)&kbd);
-            if (!EFI_ERROR(status) && kbd) {
-                uefi_call_wrapper(kbd->Reset, 2, kbd, FALSE);
-                g_keyboards[g_keyboard_count++] = kbd;
-            }
-        }
-        uefi_call_wrapper(BS->FreePool, 1, handles);
-    }
+    outb_kbc_key(0x64, 0xAE); // Tastatur-Interface aktivieren
 }
 
 void keyboard_drain(void) {
-    for (UINTN i = 0; i < g_keyboard_count; i++) {
-        EFI_KEY_DATA kdata;
-        while (!EFI_ERROR(uefi_call_wrapper(g_keyboards[i]->ReadKeyStrokeEx, 2, g_keyboards[i], &kdata))) {}
-    }
-    if (ST && ST->ConIn) {
-        EFI_INPUT_KEY ikey;
-        while (!EFI_ERROR(uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &ikey))) {}
-    }
-    int max = 16;
+    int max = 32;
     while ((inb_kbc_key(0x64) & 0x01) && --max) {
         inb_kbc_key(0x60);
     }
@@ -283,9 +160,7 @@ void keyboard_drain(void) {
 char poll_keyboard_ascii(void) {
     delete_active = 0;
 
-    // =========================================================================
-    // 1. HARDWARE PORT 0x60 (Höchste Priorität für exakte Scancodes 0x56 & 0x2B)
-    // =========================================================================
+    // HARDWARE PORT 0x60 (Set 1 Scancode Parsing)
     unsigned char stat = inb_kbc_key(0x64);
     if ((stat & 0x01) && !(stat & 0x20)) {
         unsigned char scancode = inb_kbc_key(0x60);
@@ -376,113 +251,6 @@ char poll_keyboard_ascii(void) {
                 if (c == 'y' || c == 'Y') return KEY_CTRL_Y;
             }
             return c;
-        }
-    }
-
-    // =========================================================================
-    // 2. UEFI USB Keyboard Extended Protocol (Fallback)
-    // =========================================================================
-    for (UINTN i = 0; i < g_keyboard_count; i++) {
-        EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *kbd = g_keyboards[i];
-        if (!kbd) continue;
-
-        EFI_KEY_DATA kd;
-        EFI_STATUS st = uefi_call_wrapper(kbd->ReadKeyStrokeEx, 2, kbd, &kd);
-        if (!EFI_ERROR(st)) {
-            if (kd.KeyState.KeyShiftState & EFI_SHIFT_STATE_VALID) {
-                shift_active = (kd.KeyState.KeyShiftState & (EFI_LEFT_SHIFT_PRESSED | EFI_RIGHT_SHIFT_PRESSED)) ? 1 : 0;
-                ctrl_active  = (kd.KeyState.KeyShiftState & (EFI_LEFT_CONTROL_PRESSED | EFI_RIGHT_CONTROL_PRESSED)) ? 1 : 0;
-                alt_active   = (kd.KeyState.KeyShiftState & (EFI_LEFT_ALT_PRESSED | EFI_RIGHT_ALT_PRESSED)) ? 1 : 0;
-                altgr_active = (kd.KeyState.KeyShiftState & EFI_RIGHT_ALT_PRESSED) ? 1 : 0;
-                if (kd.KeyState.KeyShiftState & (EFI_LEFT_LOGO_PRESSED | EFI_RIGHT_LOGO_PRESSED)) return KEY_SUPER;
-            }
-
-            switch (kd.Key.ScanCode) {
-                case 0x0001: return KEY_UP;
-                case 0x0002: return KEY_DOWN;
-                case 0x0003: return KEY_RIGHT;
-                case 0x0004: return KEY_LEFT;
-                case 0x0005: return KEY_HOME;
-                case 0x0006: return KEY_END;
-                case 0x0008: delete_active = 1; return KEY_DELETE;
-                case 0x0017: return KEY_ESC;
-                case 0x000B: return KEY_F1;
-                default: break;
-            }
-
-            CHAR16 u = kd.Key.UnicodeChar;
-            if (u == L'\r') return '\n';
-            if (u == L'\b') return '\b';
-            if (u == L'\t') return '\t';
-
-            if (ctrl_active && !alt_active) {
-                if (u == L'a' || u == L'A') return KEY_CTRL_A;
-                if (u == L'b' || u == L'B') return KEY_CTRL_B;
-                if (u == L'c' || u == L'C') return KEY_CTRL_C;
-                if (u == L'f' || u == L'F') return KEY_CTRL_F;
-                if (u == L'n' || u == L'N') return KEY_CTRL_N;
-                if (u == L'o' || u == L'O') return KEY_CTRL_O;
-                if (u == L's' || u == L'S') return KEY_CTRL_S;
-                if (u == L'v' || u == L'V') return KEY_CTRL_V;
-                if (u == L'x' || u == L'X') return KEY_CTRL_X;
-                if (u == L'y' || u == L'Y') return KEY_CTRL_Y;
-                if (u == L'z' || u == L'Z') return KEY_CTRL_Z;
-            }
-
-            if (g_current_layout == LAYOUT_QWERTZ) {
-                char res = convert_uefi_unicode_to_qwertz(u, shift_active, altgr_active);
-                if (res != 0) return res;
-            } else if (u >= 32) {
-                return (char)(u & 0xFF);
-            }
-        }
-    }
-
-    // =========================================================================
-    // 3. Standard UEFI ConIn Protocol (Fallback)
-    // =========================================================================
-    if (ST && ST->ConIn) {
-        EFI_INPUT_KEY ikey;
-        EFI_STATUS st = uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &ikey);
-        if (!EFI_ERROR(st)) {
-            switch (ikey.ScanCode) {
-                case 0x0001: return KEY_UP;
-                case 0x0002: return KEY_DOWN;
-                case 0x0003: return KEY_RIGHT;
-                case 0x0004: return KEY_LEFT;
-                case 0x0005: return KEY_HOME;
-                case 0x0006: return KEY_END;
-                case 0x0008: delete_active = 1; return KEY_DELETE;
-                case 0x0017: return KEY_ESC;
-                case 0x000B: return KEY_F1;
-                default: break;
-            }
-
-            CHAR16 u = ikey.UnicodeChar;
-            if (u == L'\r') return '\n';
-            if (u == L'\b') return '\b';
-            if (u == L'\t') return '\t';
-
-            if (ctrl_active && !alt_active) {
-                if (u == L'a' || u == L'A') return KEY_CTRL_A;
-                if (u == L'b' || u == L'B') return KEY_CTRL_B;
-                if (u == L'c' || u == L'C') return KEY_CTRL_C;
-                if (u == L'f' || u == L'F') return KEY_CTRL_F;
-                if (u == L'n' || u == L'N') return KEY_CTRL_N;
-                if (u == L'o' || u == L'O') return KEY_CTRL_O;
-                if (u == L's' || u == L'S') return KEY_CTRL_S;
-                if (u == L'v' || u == L'V') return KEY_CTRL_V;
-                if (u == L'x' || u == L'X') return KEY_CTRL_X;
-                if (u == L'y' || u == L'Y') return KEY_CTRL_Y;
-                if (u == L'z' || u == L'Z') return KEY_CTRL_Z;
-            }
-
-            if (g_current_layout == LAYOUT_QWERTZ) {
-                char res = convert_uefi_unicode_to_qwertz(u, shift_active, altgr_active);
-                if (res != 0) return res;
-            } else if (u >= 32) {
-                return (char)(u & 0xFF);
-            }
         }
     }
 

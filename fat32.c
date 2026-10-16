@@ -1,5 +1,11 @@
+#include <stddef.h>
+#include <stdint.h>
 #include "fat32.h"
 #include "ahci.h"
+
+#ifndef NULL
+#define NULL ((void*)0)
+#endif
 
 #define MAX_VOLUMES 8
 #define FAT_EOC           0x0FFFFFF8U
@@ -339,10 +345,14 @@ static UINT32 find_free_cluster(FAT32_VOLUME *vol) {
     UINT32 fat_sector = 0xFFFFFFFFU;
     if (!vol || !vol->initialized) return 0;
 
+    // Cluster 0 & 1 sind reserviert, Cluster 2 ist IMMER das Root-Verzeichnis!
+    // Freie Daten-Cluster fangen STRIKT bei 3 an!
     UINT32 start_c = vol->last_free_cluster_hint;
-    if (!valid_cluster(vol, start_c)) start_c = 2;
+    if (start_c < 3 || !valid_cluster(vol, start_c)) start_c = 3;
 
     for (UINT32 c = start_c; c < vol->total_clusters + 2U; c++) {
+        if (c == 2 || c == vol->bpb.root_cluster) continue; // Root-Verzeichnis NIEMALS überschreiben!
+
         UINT32 cur_sec = fat_sector_for_cluster(vol, c);
         UINT32 ent_off = fat_offset_in_sector(vol, c);
 
@@ -358,7 +368,9 @@ static UINT32 find_free_cluster(FAT32_VOLUME *vol) {
     }
 
     fat_sector = 0xFFFFFFFFU;
-    for (UINT32 c = 2; c < start_c; c++) {
+    for (UINT32 c = 3; c < start_c; c++) {
+        if (c == 2 || c == vol->bpb.root_cluster) continue;
+
         UINT32 cur_sec = fat_sector_for_cluster(vol, c);
         UINT32 ent_off = fat_offset_in_sector(vol, c);
 
@@ -610,7 +622,7 @@ int fat32_init(void *ahci_port) {
     vol->lba_offset = 0;
     vol->initialized = 0;
     vol->cached_free_bytes = 0;
-    vol->last_free_cluster_hint = 2;
+    vol->last_free_cluster_hint = 3; // Start bei 3, nicht bei 2!
 
     if (!read_sata_sector(vol->port, 0, 0, 1, sector_buf)) return 0;
 

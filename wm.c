@@ -1,6 +1,14 @@
+#include <stddef.h>
+#include <stdint.h>
 #include "wm.h"
 #include "font.h"
 #include <velo/icons.h>
+#include "syscall.h"
+#include "sched.h"
+
+#ifndef NULL
+#define NULL ((void*)0)
+#endif
 
 extern UINTN gop_width;
 extern UINTN gop_height;
@@ -10,8 +18,15 @@ void put_pixel(UINTN x, UINTN y, UINT32 color);
 UINT32 get_pixel(UINTN x, UINTN y);
 void draw_filled_rect(UINTN start_x, UINTN start_y, UINTN width, UINTN height, UINT32 color);
 
+// In wm.c:
+
+#define SURFACE_STRIDE 1024
+#define SURFACE_HEIGHT 768
+
+// Auf MAX_WINDOWS (8) sauber begrenzen
 static Window g_windows[MAX_WINDOWS];
-static UINT32 *g_win_surfaces[MAX_WINDOWS] = {0};
+static UINT32 g_static_surfaces[MAX_WINDOWS][1024 * 768] __attribute__((aligned(4096)));
+
 static int g_window_count = 0;
 static int g_active_win_id = -1;
 
@@ -42,12 +57,6 @@ static unsigned int isqrt(unsigned int val) {
 static inline void update_content_bounds(Window *win, int right, int bottom) {
     if (right > win->content_w) win->content_w = right;
     if (bottom > win->content_h) win->content_h = bottom;
-}
-
-static inline int kstrlen(const char *s) {
-    int len = 0;
-    while (s && s[len]) len++;
-    return len;
 }
 
 UINT32 wm_get_contrast_color(UINT32 bg_color) {
@@ -123,13 +132,11 @@ void wm_window_scroll(int win_id, int dx, int dy) {
     win->scroll_y += dy;
     win->scroll_x += dx;
 
-    int max_sy = win->content_h - ch;
-    if (max_sy < 0) max_sy = 0;
+    int max_sy = (win->content_h > ch) ? (win->content_h - ch) : 0;
     if (win->scroll_y < 0) win->scroll_y = 0;
     if (win->scroll_y > max_sy) win->scroll_y = max_sy;
 
-    int max_sx = win->content_w - cw;
-    if (max_sx < 0) max_sx = 0;
+    int max_sx = (win->content_w > cw) ? (win->content_w - cw) : 0;
     if (win->scroll_x < 0) win->scroll_x = 0;
     if (win->scroll_x > max_sx) win->scroll_x = max_sx;
 
@@ -331,59 +338,15 @@ void draw_rounded_rect_aa(int sx, int sy, int w, int h, int r, UINT32 color) {
 
 void draw_frosted_glass_rect(int sx, int sy, int w, int h, int r, UINT32 tint_col, UINT32 alpha) {
     if (w <= 0 || h <= 0) return;
-    int r_inner_fp = (r * 256) - 128;
-    int r_outer_fp = (r * 256) + 128;
-
+    (void)r;
     for (int y = 0; y < h; y++) {
         int py = sy + y;
         if (py < 0 || py >= (int)gop_height) continue;
-
-        int is_corner_y = (r > 0) && ((y < r) || (y >= h - r));
-        int dy = (y < r) ? (r - 1 - y) : ((y >= h - r) ? (y - (h - r)) : 0);
-        int dy2 = dy * dy;
-
         for (int x = 0; x < w; x++) {
             int px = sx + x;
             if (px < 0 || px >= (int)gop_width) continue;
-
-            int is_corner_x = (r > 0) && ((x < r) || (x >= w - r));
-            int cov_alpha = alpha;
-
-            if (is_corner_x && is_corner_y) {
-                int dx = (x < r) ? (r - 1 - x) : (x - (w - r));
-                int dist_sq = (dx * dx + dy2) * 65536;
-                int dist_fp = (int)isqrt((unsigned int)dist_sq);
-
-                if (dist_fp >= r_outer_fp) continue;
-                if (dist_fp > r_inner_fp) {
-                    int cov = (r_outer_fp - dist_fp);
-                    cov_alpha = (alpha * cov) / 256;
-                }
-            }
-
-            UINT32 sum_r = 0, sum_g = 0, sum_b = 0;
-            int samples = 0;
-
-            for (int ky = -1; ky <= 1; ky++) {
-                int by = py + ky;
-                if (by < 0 || by >= (int)gop_height) continue;
-                for (int kx = -1; kx <= 1; kx++) {
-                    int bx = px + kx;
-                    if (bx < 0 || bx >= (int)gop_width) continue;
-                    UINT32 pcol = get_pixel((UINTN)bx, (UINTN)by);
-                    sum_r += (pcol >> 16) & 0xFF;
-                    sum_g += (pcol >> 8) & 0xFF;
-                    sum_b += pcol & 0xFF;
-                    samples++;
-                }
-            }
-
-            UINT32 blurred_bg = (samples > 0) ? 
-                (((sum_r / samples) << 16) | ((sum_g / samples) << 8) | (sum_b / samples)) : 
-                get_pixel((UINTN)px, (UINTN)py);
-
-            UINT32 glass_pixel = alpha_blend(tint_col, blurred_bg, (UINT32)cov_alpha);
-            put_pixel((UINTN)px, (UINTN)py, glass_pixel);
+            UINT32 bg = get_pixel((UINTN)px, (UINTN)py);
+            put_pixel((UINTN)px, (UINTN)py, alpha_blend(tint_col, bg, alpha));
         }
     }
 }
@@ -569,14 +532,10 @@ void wm_surface_clear(int win_id, UINT32 color) {
     int cw = win->is_maximized ? win->width : win->width - 12;
     int ch = win->is_maximized ? win->height - 30 : win->height - 36;
     if (cw > SURFACE_STRIDE) cw = SURFACE_STRIDE;
+    if (ch > SURFACE_HEIGHT) ch = SURFACE_HEIGHT;
+    if (cw <= 0 || ch <= 0) return;
 
-    int clear_h = win->content_h > ch ? win->content_h : ch;
-    int needed_h = win->scroll_y + ch;
-    if (needed_h > clear_h) clear_h = needed_h;
-    if (clear_h > SURFACE_HEIGHT) clear_h = SURFACE_HEIGHT;
-    if (cw <= 0 || clear_h <= 0) return;
-
-    for (int y = 0; y < clear_h; y++) {
+    for (int y = 0; y < ch; y++) {
         UINT32 *row = &win->surface[y * SURFACE_STRIDE];
         for (int x = 0; x < cw; x++) row[x] = color;
     }
@@ -591,8 +550,8 @@ void wm_surface_draw_rect(int win_id, int x, int y, int w, int h, UINT32 color) 
 
     int max_w = SURFACE_STRIDE;
     int max_h = SURFACE_HEIGHT;
-    int min_y = (win->scroll_y > 0) ? min_y = win->scroll_y : 0;
-    int min_x = (win->scroll_x > 0) ? min_x = win->scroll_x : 0;
+    int min_y = (win->scroll_y > 0) ? win->scroll_y : 0;
+    int min_x = (win->scroll_x > 0) ? win->scroll_x : 0;
 
     int x1 = (x < min_x) ? min_x : x;
     int y1 = (y < min_y) ? min_y : y;
@@ -781,7 +740,12 @@ void wm_init(void) {
     g_drag_win_id = -1;
 
     for (int i = 0; i < MAX_WINDOWS; i++) {
+        g_windows[i].id = i;
         g_windows[i].is_closed = 1;
+        g_windows[i].is_active = 0;
+        g_windows[i].is_minimized = 0;
+        g_windows[i].is_maximized = 0;
+        g_windows[i].on_paint = NULL;
         g_windows[i].on_click = NULL;
         g_windows[i].on_key = NULL;
         g_windows[i].ev_q_head = 0;
@@ -791,14 +755,17 @@ void wm_init(void) {
         g_windows[i].content_w = 0;
         g_windows[i].content_h = 0;
         g_windows[i].auto_scroll = 1;
-        g_windows[i].surface = g_win_surfaces[i];
+        g_windows[i].surface = g_static_surfaces[i];
         g_windows[i].anim_state = ANIM_NONE;
         g_windows[i].anim_progress = 100;
+        g_windows[i].title[0] = '\0';
     }
     wm_mark_all_dirty();
 }
 
 int wm_create_window(int x, int y, int w, int h, const char *title, void (*on_paint)(int, int, int, int, int)) {
+    if (!title || !title[0]) title = "Fenster";
+
     for (int i = 0; i < MAX_WINDOWS; i++) {
         if (!g_windows[i].is_closed) {
             int match = 1, p = 0;
@@ -820,19 +787,6 @@ int wm_create_window(int x, int y, int w, int h, const char *title, void (*on_pa
     }
     if (slot == -1) return -1;
 
-    if (!g_win_surfaces[slot]) {
-        UINTN surf_bytes = (UINTN)SURFACE_STRIDE * SURFACE_HEIGHT * sizeof(UINT32);
-        UINTN pages = EFI_SIZE_TO_PAGES(surf_bytes);
-        EFI_PHYSICAL_ADDRESS phys = 0;
-        if (BS && BS->AllocatePages) {
-            EFI_STATUS status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages, EfiLoaderData, pages, &phys);
-            if (status == EFI_SUCCESS && phys != 0) g_win_surfaces[slot] = (UINT32*)(UINTN)phys;
-        }
-        if (!g_win_surfaces[slot]) {
-            g_win_surfaces[slot] = (UINT32*)AllocateZeroPool(surf_bytes);
-        }
-    }
-
     Window *win = &g_windows[slot];
     win->id = slot;
     win->x = x;
@@ -849,7 +803,7 @@ int wm_create_window(int x, int y, int w, int h, const char *title, void (*on_pa
     win->is_closed = 0;
     win->is_dirty_content = 1;
     win->bg_color = 0x000F172A;
-    win->surface = g_win_surfaces[slot];
+    win->surface = g_static_surfaces[slot];
     win->scroll_x = 0;
     win->scroll_y = 0;
     win->content_w = w - 12;
@@ -861,20 +815,22 @@ int wm_create_window(int x, int y, int w, int h, const char *title, void (*on_pa
     win->on_click = NULL;
     win->on_key = NULL;
 
-    /* Pop-In Startanimation */
-    win->anim_state = ANIM_OPENING;
-    win->anim_progress = 10;
-
-    int cw = w - 12, ch = h - 36;
-    if (win->surface && cw > 0 && ch > 0) {
-        for (int py = 0; py < ch; py++) {
-            for (int px = 0; px < cw; px++) win->surface[py * SURFACE_STRIDE + px] = win->bg_color;
-        }
-    }
+    win->anim_state = ANIM_NONE;
+    win->anim_progress = 100;
 
     int p = 0;
     while (title[p] && p < 63) { win->title[p] = title[p]; p++; }
     win->title[p] = '\0';
+
+    int cw = w - 12, ch = h - 36;
+    if (cw > SURFACE_STRIDE) cw = SURFACE_STRIDE;
+    if (ch > SURFACE_HEIGHT) ch = SURFACE_HEIGHT;
+    if (win->surface && cw > 0 && ch > 0) {
+        for (int py = 0; py < ch; py++) {
+            UINT32 *row = &win->surface[py * SURFACE_STRIDE];
+            for (int px = 0; px < cw; px++) row[px] = win->bg_color;
+        }
+    }
 
     g_window_count++;
     wm_focus_window(slot);
@@ -897,12 +853,133 @@ int wm_create_window_auto(const char *title, int content_w, int content_h, void 
     return wm_create_window(x, y, total_w, total_h, title, on_paint);
 }
 
+// In wm.c
+
+// In wm.c:
+
+int wm_handle_mouse(int mouse_x, int mouse_y, int left_click, int right_click, int scroll_x, int scroll_y) {
+    if (!left_click && wm_is_dragging()) {
+        wm_stop_drag();
+    }
+    if (wm_is_dragging()) {
+        wm_update_drag(mouse_x, mouse_y);
+        return 1;
+    }
+
+    // Von oben nach unten durch alle sichtbaren Fenster gehen
+    for (int z = g_z_count - 1; z >= 0; z--) {
+        int wid = g_z_order[z];
+        if (wid < 0 || wid >= MAX_WINDOWS) continue;
+        Window *win = &g_windows[wid];
+        if (win->is_closed || win->is_minimized) continue;
+
+        // Liegt der Mauszeiger im Fensterbereich?
+        if (mouse_x >= win->x && mouse_x < win->x + win->width &&
+            mouse_y >= win->y && mouse_y < win->y + win->height) {
+
+            int off_x = win->is_maximized ? 0 : 6;
+            int off_y = 30;
+            int local_x = mouse_x - (win->x + off_x);
+            int local_y = mouse_y - (win->y + off_y);
+
+            // 1. SCROLLEN: Direkt und ohne Umwege in die Event-Queues dieses Fensters!
+            if (scroll_y != 0 || scroll_x != 0) {
+                wm_window_push_event(wid, VELO_EV_SCROLL, local_x, local_y, 0, scroll_x, scroll_y);
+                
+                // An Task-Queue der Userland-App senden
+                extern int g_app_win_ids[MAX_TASKS];
+                for (int t = 1; t < MAX_TASKS; t++) {
+                    if (g_app_win_ids[t] == wid) {
+                        task_push_event(t, VELO_EV_SCROLL, local_x, local_y, 0, scroll_x, scroll_y);
+                        break;
+                    }
+                }
+                wm_mark_dirty(win->x, win->y, win->width, win->height);
+                return 1; // Konsumiert!
+            }
+
+            // 2. TITELLEISTEN-BUTTONS (Close, Max, Min)
+            int btn_top = win->y + 5;
+            int btn_h = 20;
+
+            if (left_click && mouse_y >= btn_top && mouse_y <= btn_top + btn_h) {
+                if (mouse_x >= win->x + win->width - 26 && mouse_x <= win->x + win->width - 10) {
+                    wm_close_window(wid);
+                    return 1;
+                } else if (mouse_x >= win->x + win->width - 46 && mouse_x <= win->x + win->width - 30) {
+                    wm_maximize_window(wid);
+                    return 1;
+                } else if (mouse_x >= win->x + win->width - 66 && mouse_x <= win->x + win->width - 50) {
+                    wm_minimize_window(wid);
+                    return 1;
+                }
+            }
+
+            // 3. FENSTER AKTIVIEREN / FOKUSSIEREN
+            if (left_click || right_click) {
+                wm_focus_window(wid);
+            }
+
+            // 4. DRAG STARTEN
+            if (left_click && mouse_y >= win->y && mouse_y < win->y + 30 && mouse_x < win->x + win->width - 70) {
+                wm_start_drag(wid, mouse_x, mouse_y);
+                return 1;
+            }
+
+            // 5. CONTENT-KLICK AN APP SENDEN
+            if (left_click) {
+                wm_window_push_event(wid, VELO_EV_CLICK, local_x, local_y, 0, 0, 0);
+                extern int g_app_win_ids[MAX_TASKS];
+                for (int t = 1; t < MAX_TASKS; t++) {
+                    if (g_app_win_ids[t] == wid) {
+                        task_push_event(t, VELO_EV_CLICK, local_x, local_y, 0, 0, 0);
+                        break;
+                    }
+                }
+                if (win->on_click) win->on_click(wid, local_x, local_y);
+                return 1;
+            } else if (right_click) {
+                wm_window_push_event(wid, VELO_EV_RCLICK, local_x, local_y, 0, 0, 0);
+                extern int g_app_win_ids[MAX_TASKS];
+                for (int t = 1; t < MAX_TASKS; t++) {
+                    if (g_app_win_ids[t] == wid) {
+                        task_push_event(t, VELO_EV_RCLICK, local_x, local_y, 0, 0, 0);
+                        break;
+                    }
+                }
+                return 1;
+            }
+
+            return 1; // Maus ist über dem Fenster -> Desktop darf nichts tun!
+        }
+    }
+
+    return 0; // Kein Fenster getroffen -> Event gehört dem Desktop
+}
+
+void draw_velo_startorb(int cx, int cy, int r) {
+    if (r <= 0) return;
+    draw_rounded_rect_aa(cx - r, cy - r, r * 2, r * 2, r, 0x005AC0E0);
+    draw_rounded_rect_gradient(cx - r + 2, cy - r + 2, (r - 2) * 2, (r - 2) * 2, r - 2, 0x001B62D6, 0x000A2C68);
+
+    int size = (r * 7) / 10;
+    if (size < 4) size = 4;
+    draw_line_aa(cx - size, cy - size + 2, cx - size / 4, cy + size, 3, 0x00FFFFFF);
+    draw_line_aa(cx - size / 4, cy + size, cx + size - 2, cy - size, 3, 0x00FFFFFF);
+    draw_line_aa(cx - size - 2, cy + 1, cx + size + 4, cy - 2, 3, 0x005AC0E0);
+    draw_line_aa(cx - size - 1, cy + 1, cx + size + 2, cy - 2, 1, 0x00FFFFFF);
+}
+
 void wm_close_window(int id) {
     if (id < 0 || id >= MAX_WINDOWS || g_windows[id].is_closed) return;
+
     g_windows[id].is_closed = 1;
     g_windows[id].is_active = 0;
+    g_windows[id].is_minimized = 0;
     g_windows[id].anim_state = ANIM_NONE;
-    g_window_count--;
+    g_windows[id].anim_progress = 100;
+    g_windows[id].title[0] = '\0';
+    if (g_window_count > 0) g_window_count--;
 
     for (int i = 0; i < g_z_count; i++) {
         if (g_z_order[i] == id) {
@@ -931,13 +1008,12 @@ void wm_minimize_window_to(int id, int dock_x, int dock_y) {
     if (!win->is_minimized) {
         win->target_dock_x = dock_x;
         win->target_dock_y = dock_y;
-        win->anim_state = ANIM_MINIMIZE;
-        win->anim_progress = 0;
+        win->is_minimized = 1;
         win->is_active = 0;
+        win->anim_state = ANIM_NONE;
     } else {
         win->is_minimized = 0;
-        win->anim_state = ANIM_RESTORE;
-        win->anim_progress = 0;
+        win->anim_state = ANIM_NONE;
         wm_focus_window(id);
     }
     wm_mark_all_dirty();
@@ -973,6 +1049,8 @@ void wm_maximize_window(int id) {
         win->y = 24;
         new_w = (int)gop_width;
         new_h = (int)gop_height - 24;
+        if (new_w > SURFACE_STRIDE) new_w = SURFACE_STRIDE;
+        if (new_h > SURFACE_HEIGHT) new_h = SURFACE_HEIGHT;
         win->is_maximized = 1;
     } else {
         win->x = win->orig_x;
@@ -984,7 +1062,10 @@ void wm_maximize_window(int id) {
 
     win->width = new_w;
     win->height = new_h;
+    win->scroll_x = 0;
+    win->scroll_y = 0;
     win->is_dirty_content = 1;
+    
     wm_surface_clear(id, win->bg_color);
 
     if (win->on_paint) {
@@ -1017,7 +1098,7 @@ void wm_focus_window(int id) {
     if (cur_pos != -1) {
         for (int i = cur_pos; i < g_z_count - 1; i++) g_z_order[i] = g_z_order[i + 1];
         g_z_order[g_z_count - 1] = id;
-    } else {
+    } else if (g_z_count < MAX_WINDOWS) {
         g_z_order[g_z_count++] = id;
     }
     wm_mark_all_dirty();
@@ -1032,24 +1113,7 @@ void wm_focus_next(void) {
 }
 
 int wm_tick_animations(void) {
-    int active_anims = 0;
-    for (int i = 0; i < MAX_WINDOWS; i++) {
-        Window *win = &g_windows[i];
-        if (win->is_closed || win->anim_state == ANIM_NONE) continue;
-
-        active_anims = 1;
-        win->anim_progress += 20;
-
-        if (win->anim_progress >= 100) {
-            if (win->anim_state == ANIM_MINIMIZE) {
-                win->is_minimized = 1;
-            }
-            win->anim_state = ANIM_NONE;
-            win->anim_progress = 100;
-        }
-    }
-    if (active_anims) wm_mark_all_dirty();
-    return active_anims;
+    return 0;
 }
 
 Window* wm_get_window(int id) {
@@ -1074,76 +1138,44 @@ int wm_get_z_window(int z_idx) {
     return g_z_order[z_idx];
 }
 
-/* =========================================================================
- * RENDERING: KNÖPFE OBEN RECHTS & TITEL LINKS MIT HOHEM KONTRAST
- * ========================================================================= */
 static void render_window_frame(Window *win) {
-    if (win->is_closed || (win->is_minimized && win->anim_state == ANIM_NONE)) return;
+    if (win->is_closed || win->is_minimized) return;
 
     int x = win->x, y = win->y, w = win->width, h = win->height;
-
-    if (win->anim_state == ANIM_MINIMIZE) {
-        int p = win->anim_progress;
-        x = win->x + ((win->target_dock_x - win->x) * p) / 100;
-        y = win->y + ((win->target_dock_y - win->y) * p) / 100;
-        w = win->width - ((win->width - 40) * p) / 100;
-        h = win->height - ((win->height - 40) * p) / 100;
-    } else if (win->anim_state == ANIM_RESTORE) {
-        int p = 100 - win->anim_progress;
-        x = win->x + ((win->target_dock_x - win->x) * p) / 100;
-        y = win->y + ((win->target_dock_y - win->y) * p) / 100;
-        w = win->width - ((win->width - 40) * p) / 100;
-        h = win->height - ((win->height - 40) * p) / 100;
-    } else if (win->anim_state == ANIM_OPENING) {
-        int p = win->anim_progress;
-        int diff_w = (win->width * (100 - p)) / 200;
-        int diff_h = (win->height * (100 - p)) / 200;
-        x = win->x + diff_w;
-        y = win->y + diff_h;
-        w = win->width - diff_w * 2;
-        h = win->height - diff_h * 2;
-    }
-
     if (w < 80) w = 80;
     if (h < 40) h = 40;
 
-    if (!win->is_maximized && win->anim_state == ANIM_NONE) {
+    if (!win->is_maximized) {
         draw_shadow_box(x, y, w, h, 10);
         UINT32 border_col = win->is_active ? 0x0038BDF8 : 0x00334155;
         draw_rounded_rect_aa(x, y, w, h, 12, border_col);
-    } else if (win->anim_state != ANIM_NONE) {
-        draw_rounded_rect_aa(x - 1, y - 1, w + 2, h + 2, 10, 0x0038BDF8);
     }
 
-    // Titelleiste
     UINT32 top_glass = win->is_active ? 0x001E293B : 0x000F172A;
     UINT32 bot_glass = win->is_active ? 0x000F172A : 0x00020617;
     int title_r = win->is_maximized ? 0 : 11;
     draw_rounded_rect_gradient(x, y, w, 30, title_r, top_glass, bot_glass);
     draw_filled_rect((UINTN)x, (UINTN)(y + 29), (UINTN)w, 1, win->is_active ? 0x00334155 : 0x001E293B);
 
-    // Knöpfe OBEN RECHTS: Rot (Schließen), Grün (Maximieren), Gelb (Minimieren)
     int btn_cy = y + 15;
     draw_circle_button_aa(x + w - 18, btn_cy, 6, 0x00EF4444, 0x00F87171);
     draw_circle_button_aa(x + w - 38, btn_cy, 6, 0x0010B981, 0x0034D399);
     draw_circle_button_aa(x + w - 58, btn_cy, 6, 0x00F59E0B, 0x00FBBF24);
 
-    // Titel links mit Kontrastprüfung
     UINT32 title_fg = wm_get_contrast_color(top_glass);
     wm_draw_text_shadow(win->title, x + 14, y + 7, 1, title_fg, 0x00020617);
 
     int off_x = win->is_maximized ? 0 : 6, off_y = 30;
-    int cw = w - 12;
-    int ch = h - 36;
+    int cw = win->is_maximized ? win->width : win->width - 12;
+    int ch = win->is_maximized ? win->height - 30 : win->height - 36;
     if (cw < 10) cw = 10;
     if (ch < 10) ch = 10;
 
-    int has_v_scroll = (win->auto_scroll && win->content_h > ch && win->anim_state == ANIM_NONE);
+    int has_v_scroll = (win->auto_scroll && win->content_h > ch);
     int sb_w = has_v_scroll ? 14 : 0;
     int view_w = cw - sb_w;
 
-    int max_scroll_y = win->content_h - ch;
-    if (max_scroll_y < 0) max_scroll_y = 0;
+    int max_scroll_y = (win->content_h > ch) ? (win->content_h - ch) : 0;
     if (win->scroll_y < 0) win->scroll_y = 0;
     if (win->scroll_y > max_scroll_y) win->scroll_y = max_scroll_y;
 
@@ -1153,6 +1185,7 @@ static void render_window_frame(Window *win) {
 
         if (dst_x < 0) { src_x += -dst_x; draw_w += dst_x; dst_x = 0; }
         if (dst_x + draw_w > (int)gop_width) draw_w = (int)gop_width - dst_x;
+        if (src_x + draw_w > SURFACE_STRIDE) draw_w = SURFACE_STRIDE - src_x;
 
         if (draw_w > 0) {
             UINTN copy_bytes = (UINTN)draw_w * sizeof(UINT32);
@@ -1175,7 +1208,7 @@ static void render_window_frame(Window *win) {
         draw_rounded_rect_gradient(sb_x, sb_y, sb_w, ch, 0, 0x000F172A, 0x00020617);
         draw_line_aa(sb_x, sb_y, sb_x, sb_y + ch, 1, 0x001E293B);
 
-        int thumb_h = (ch * ch) / win->content_h;
+        int thumb_h = (win->content_h > 0) ? (ch * ch) / win->content_h : ch;
         if (thumb_h < 24) thumb_h = 24;
         if (thumb_h > ch) thumb_h = ch;
 
@@ -1185,15 +1218,22 @@ static void render_window_frame(Window *win) {
         draw_rounded_rect_gradient(sb_x + 2, thumb_y, sb_w - 4, thumb_h, 4, 0x0038BDF8, 0x000284C7);
     }
 
-    if (win->on_paint && win->anim_state == ANIM_NONE) {
+    if (win->on_paint) {
         win->on_paint(win->id, x + off_x, y + off_y, cw, ch);
     }
 }
 
 void wm_render_all(void) {
+    int rendered[MAX_WINDOWS];
+    for (int i = 0; i < MAX_WINDOWS; i++) rendered[i] = 0;
+
     for (int i = 0; i < g_z_count; i++) {
         int id = g_z_order[i];
-        if (id >= 0 && id < MAX_WINDOWS && !g_windows[id].is_closed) {
+        if (id < 0 || id >= MAX_WINDOWS) continue;
+        if (rendered[id]) continue;
+        rendered[id] = 1;
+
+        if (!g_windows[id].is_closed) {
             render_window_frame(&g_windows[id]);
         }
     }
